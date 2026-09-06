@@ -69,6 +69,7 @@ import org.apache.pinot.query.mailbox.MailboxService;
 import org.apache.pinot.query.planner.PlanFragment;
 import org.apache.pinot.query.planner.physical.DispatchablePlanFragment;
 import org.apache.pinot.query.planner.physical.DispatchableSubPlan;
+import org.apache.pinot.query.planner.plannode.MailboxReceiveNode;
 import org.apache.pinot.query.planner.plannode.MailboxSendNode;
 import org.apache.pinot.query.planner.plannode.PlanNode;
 import org.apache.pinot.query.planner.serde.PlanNodeDeserializer;
@@ -285,11 +286,15 @@ public class QueryDispatcher {
           throw new IllegalStateException("Stage dispatch graph is incomplete but has no ready group");
         }
         for (Set<Integer> group : readyGroups) {
-          dispatchGraph.markDispatched(group);
           Set<Integer> remoteStageIds = new HashSet<>(group);
           remoteStageIds.remove(0);
           Set<DispatchablePlanFragment> readyStagePlans =
               selectStagePlans(stagePlansWithoutRoot, remoteStageIds);
+          if (QueryOptionsUtils.isMaterializedExchange(queryOptions)) {
+            bindMaterializedInputs(requestId, readyStagePlans, dispatchableSubPlan,
+                session.getMaterializedOutputs());
+          }
+          dispatchGraph.markDispatched(group);
           submitWithStream(requestId, readyStagePlans, deadline, servers, queryOptions, session);
 
           if (statsManager != null) {
@@ -372,6 +377,38 @@ public class QueryDispatcher {
       throw new IllegalStateException("Unknown non-root stage ids: " + stageIds);
     }
     return selected;
+  }
+
+  private static void bindMaterializedInputs(long requestId, Set<DispatchablePlanFragment> consumerStages,
+      DispatchableSubPlan subPlan, List<Worker.MaterializedPartitionHandle> materializedOutputs) {
+    Map<Integer, DispatchablePlanFragment> stages = subPlan.getQueryStageMap();
+    for (DispatchablePlanFragment consumerStage : consumerStages) {
+      Set<Integer> producerStageIds = new HashSet<>();
+      collectMaterializedProducerStageIds(consumerStage.getPlanFragment().getFragmentRoot(), producerStageIds);
+      if (producerStageIds.isEmpty()) {
+        continue;
+      }
+      if (producerStageIds.size() != 1) {
+        throw new IllegalStateException("Multiple materialized inputs for consumer stage "
+            + consumerStage.getPlanFragment().getFragmentId() + " are not supported");
+      }
+      int producerStageId = producerStageIds.iterator().next();
+      DispatchablePlanFragment producerStage = stages.get(producerStageId);
+      if (producerStage == null) {
+        throw new IllegalStateException("Unknown materialized producer stage: " + producerStageId);
+      }
+      consumerStage.setWorkerMetadataList(MaterializedPartitionRouter.route(requestId, producerStageId,
+          producerStage.getWorkerMetadataList(), consumerStage.getWorkerMetadataList(), materializedOutputs));
+    }
+  }
+
+  private static void collectMaterializedProducerStageIds(PlanNode node, Set<Integer> producerStageIds) {
+    if (node instanceof MailboxReceiveNode && ((MailboxReceiveNode) node).isMaterialized()) {
+      producerStageIds.add(((MailboxReceiveNode) node).getSenderStageId());
+    }
+    for (PlanNode input : node.getInputs()) {
+      collectMaterializedProducerStageIds(input, producerStageIds);
+    }
   }
 
   /// Streaming variant of [#submitAndReduce]: opens one `SubmitWithStream` bidi RPC per server, runs the

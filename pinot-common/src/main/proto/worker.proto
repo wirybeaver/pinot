@@ -94,6 +94,7 @@ message WorkerMetadata {
   int32 workedId = 1;
   map<int32, bytes> mailboxInfos = 2; // Stage id to serialized MailboxInfos
   map<string, string> customProperty = 3;
+  repeated MaterializedPartitionHandle materialized_input = 4;
 }
 
 message MailboxInfos {

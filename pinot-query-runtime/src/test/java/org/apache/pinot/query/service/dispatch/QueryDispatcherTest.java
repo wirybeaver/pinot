@@ -31,6 +31,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.pinot.common.failuredetector.FailureDetector;
 import org.apache.pinot.common.metrics.BrokerMetrics;
@@ -42,6 +43,8 @@ import org.apache.pinot.query.QueryTestSet;
 import org.apache.pinot.query.mailbox.MailboxService;
 import org.apache.pinot.query.planner.physical.DispatchablePlanFragment;
 import org.apache.pinot.query.planner.physical.DispatchableSubPlan;
+import org.apache.pinot.query.planner.plannode.MailboxReceiveNode;
+import org.apache.pinot.query.planner.plannode.PlanNode;
 import org.apache.pinot.query.routing.QueryServerInstance;
 import org.apache.pinot.query.routing.StagePlan;
 import org.apache.pinot.query.routing.WorkerMetadata;
@@ -63,6 +66,13 @@ import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.anySet;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNotNull;
@@ -183,6 +193,94 @@ public class QueryDispatcherTest extends QueryTestSet {
     }
     assertEquals(actualCalls, selectedStage.getWorkerMetadataList().size());
     assertEquals(actualWorkerIds, expectedWorkerIds);
+  }
+
+  @Test
+  public void testStagedDispatchBindsMaterializedInputsBeforeConsumerSubmit()
+      throws Exception {
+    DispatchableSubPlan subPlan = _queryEnvironment.planQuery(
+        "SET materializedExchange=true; SELECT col1, COUNT(*) FROM a GROUP BY col1");
+    DispatchablePlanFragment consumerStage = subPlan.getQueryStagesWithoutRoot().stream()
+        .filter(stage -> findMaterializedReceive(stage.getPlanFragment().getFragmentRoot()) != null)
+        .findFirst()
+        .orElseThrow();
+    MailboxReceiveNode receiveNode = findMaterializedReceive(consumerStage.getPlanFragment().getFragmentRoot());
+    assertNotNull(receiveNode);
+    DispatchablePlanFragment producerStage = subPlan.getQueryStageMap().get(receiveNode.getSenderStageId());
+    assertTrue(consumerStage.getWorkerMetadataList().stream()
+        .allMatch(worker -> worker.getMaterializedInputs().isEmpty()));
+    long requestId = REQUEST_ID_GEN.getAndIncrement();
+    AtomicBoolean producerCompleted = new AtomicBoolean();
+    List<WorkerMetadata> submittedConsumerWorkers = new ArrayList<>();
+    QueryDispatcher dispatcher =
+        spy(new QueryDispatcher(mock(MailboxService.class), mock(FailureDetector.class), null,
+            true, Duration.ofSeconds(1)));
+    doAnswer(invocation -> {
+      @SuppressWarnings("unchecked")
+      Set<DispatchablePlanFragment> submittedStages = invocation.getArgument(1);
+      StreamingQuerySession session = invocation.getArgument(5);
+      boolean submitsConsumer = submittedStages.stream().anyMatch(
+          stage -> stage.getPlanFragment().getFragmentId() == consumerStage.getPlanFragment().getFragmentId());
+      if (submitsConsumer) {
+        assertTrue(producerCompleted.get());
+      }
+      for (DispatchablePlanFragment submittedStage : submittedStages) {
+        int stageId = submittedStage.getPlanFragment().getFragmentId();
+        if (stageId == consumerStage.getPlanFragment().getFragmentId()) {
+          submittedConsumerWorkers.addAll(submittedStage.getWorkerMetadataList());
+        }
+        for (WorkerMetadata worker : submittedStage.getWorkerMetadataList()) {
+          Worker.OpChainComplete.Builder completion = Worker.OpChainComplete.newBuilder()
+              .setStageId(stageId)
+              .setWorkerId(worker.getWorkerId())
+              .setSuccess(true);
+          if (stageId == producerStage.getPlanFragment().getFragmentId()) {
+            for (WorkerMetadata consumerWorker : consumerStage.getWorkerMetadataList()) {
+              completion.addMaterializedOutput(materializedHandle(requestId, stageId, worker.getWorkerId(),
+                  consumerWorker.getWorkerId()));
+            }
+          }
+          session.recordOpChainComplete(completion.build());
+        }
+        if (stageId == producerStage.getPlanFragment().getFragmentId()) {
+          producerCompleted.set(true);
+        }
+      }
+      return null;
+    }).when(dispatcher).submitWithStream(eq(requestId), anySet(), any(), anySet(), anyMap(), any());
+
+    RequestContext context = new DefaultRequestContext();
+    context.setRequestId(requestId);
+    QueryDispatcher.QueryResult queryResult;
+    try {
+      try (QueryThreadContext ignore = QueryThreadContext.openForMseTest()) {
+        queryResult = dispatcher.submitAndReduce(context, subPlan, 1_000L,
+            Map.of("materializedExchange", "true", "stagedDispatch", "true"));
+      }
+    } finally {
+      dispatcher.shutdown();
+    }
+
+    assertNotNull(queryResult.getProcessingException());
+    assertEquals(submittedConsumerWorkers.size(), consumerStage.getWorkerMetadataList().size());
+    for (WorkerMetadata submittedWorker : submittedConsumerWorkers) {
+      assertEquals(submittedWorker.getMaterializedInputs().size(), producerStage.getWorkerMetadataList().size());
+      assertTrue(submittedWorker.getMaterializedInputs().stream().allMatch(
+          handle -> handle.getLogicalPartitionId() == submittedWorker.getWorkerId()));
+    }
+  }
+
+  private static MailboxReceiveNode findMaterializedReceive(PlanNode node) {
+    if (node instanceof MailboxReceiveNode && ((MailboxReceiveNode) node).isMaterialized()) {
+      return (MailboxReceiveNode) node;
+    }
+    for (PlanNode input : node.getInputs()) {
+      MailboxReceiveNode receiveNode = findMaterializedReceive(input);
+      if (receiveNode != null) {
+        return receiveNode;
+      }
+    }
+    return null;
   }
 
   private static Worker.MaterializedPartitionHandle materializedHandle(long requestId, int stageId, int workerId,
