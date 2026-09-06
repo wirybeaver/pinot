@@ -24,6 +24,8 @@ import java.io.DataOutputStream;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -37,6 +39,7 @@ import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertNull;
+import static org.testng.Assert.assertThrows;
 import static org.testng.Assert.assertTrue;
 
 
@@ -44,6 +47,78 @@ import static org.testng.Assert.assertTrue;
 /// as soon as all expected opchains have reported, without waiting for the timeout), timeout fall-through, and
 /// fan-out cancel behaviour.
 public class StreamingQuerySessionTest {
+
+  @Test
+  public void testAwaitSuccessfulStagesRequiresEveryUniqueExpectedWorker()
+      throws Exception {
+    StreamingQuerySession session =
+        new StreamingQuerySession(1L, 3, Map.of(1, Set.of(0, 1), 2, Set.of(0)));
+
+    session.recordOpChainComplete(buildOpChainComplete(1, 0, 1, 5));
+    session.recordOpChainComplete(buildOpChainComplete(1, 0, 1, 5));
+    assertThrows(IllegalStateException.class,
+        () -> session.awaitSuccessfulStages(Set.of(1), 10, TimeUnit.MILLISECONDS));
+
+    session.recordOpChainComplete(buildOpChainComplete(1, 1, 1, 7));
+    session.awaitSuccessfulStages(Set.of(1), 1, TimeUnit.SECONDS);
+
+    assertThrows(IllegalStateException.class,
+        () -> session.awaitSuccessfulStages(Set.of(1, 2), 10, TimeUnit.MILLISECONDS));
+    session.recordOpChainComplete(buildOpChainComplete(2, 0, 1, 11));
+    session.awaitSuccessfulStages(Set.of(1, 2), 1, TimeUnit.SECONDS);
+  }
+
+  @Test
+  public void testAwaitSuccessfulStagesRejectsUnexpectedIdentity() {
+    StreamingQuerySession session =
+        new StreamingQuerySession(1L, 1, Map.of(1, Set.of(0)));
+
+    session.recordOpChainComplete(buildOpChainCompleteWithoutStats(1, 1, true));
+
+    assertThrows(IllegalStateException.class,
+        () -> session.awaitSuccessfulStages(Set.of(1), 1, TimeUnit.SECONDS));
+  }
+
+  @Test
+  public void testAwaitSuccessfulStagesRejectsExecutionFailure() {
+    StreamingQuerySession session =
+        new StreamingQuerySession(1L, 1, Map.of(1, Set.of(0)));
+
+    session.recordOpChainComplete(buildOpChainCompleteWithoutStats(1, 0, false));
+
+    assertThrows(IllegalStateException.class,
+        () -> session.awaitSuccessfulStages(Set.of(1), 1, TimeUnit.SECONDS));
+  }
+
+  @Test
+  public void testStatsDecodeFailureStillSatisfiesExecutionBarrier()
+      throws Exception {
+    StreamingQuerySession session =
+        new StreamingQuerySession(1L, 1, Map.of(1, Set.of(0)));
+
+    session.recordOpChainComplete(buildOpChainCompleteWithTypeId(1, 0, 9999, ByteString.EMPTY));
+
+    session.awaitSuccessfulStages(Set.of(1), 1, TimeUnit.SECONDS);
+  }
+
+  @Test
+  public void testAwaitStreamsClosedTracksRegistrationAndTransportFailure()
+      throws Exception {
+    StreamingQuerySession session = new StreamingQuerySession(1L, 0, Map.of());
+    StreamingServerHandle stream = requestId -> { };
+    session.registerStream(stream);
+
+    assertThrows(IllegalStateException.class,
+        () -> session.awaitStreamsClosed(10, TimeUnit.MILLISECONDS));
+
+    session.unregisterStream(stream);
+    session.awaitStreamsClosed(1, TimeUnit.SECONDS);
+
+    session.registerStream(stream);
+    session.recordStreamError(stream, new RuntimeException("transport"), 0);
+    assertThrows(IllegalStateException.class,
+        () -> session.awaitStreamsClosed(1, TimeUnit.SECONDS));
+  }
 
   @Test
   public void testCollectsMaterializedOutputsFromSuccessfulOpChains() {
@@ -382,6 +457,15 @@ public class StreamingQuerySessionTest {
         .setWorkerId(workerId)
         .setSuccess(false)
         .setErrorMsg(errorMsg)
+        .build();
+  }
+
+  private static Worker.OpChainComplete buildOpChainCompleteWithoutStats(
+      int stageId, int workerId, boolean success) {
+    return Worker.OpChainComplete.newBuilder()
+        .setStageId(stageId)
+        .setWorkerId(workerId)
+        .setSuccess(success)
         .build();
   }
 

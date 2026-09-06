@@ -205,6 +205,9 @@ public class QueryDispatcher {
   public QueryResult submitAndReduce(RequestContext context, DispatchableSubPlan dispatchableSubPlan, long timeoutMs,
       Map<String, String> queryOptions, @Nullable ServerRoutingStatsManager statsManager)
       throws Exception {
+    if (isStagedDispatch(queryOptions)) {
+      return submitAndReduceStaged(context, dispatchableSubPlan, timeoutMs, queryOptions, statsManager);
+    }
     if (QueryOptionsUtils.isMaterializedExchange(queryOptions)
         || QueryOptionsUtils.isStreamStats(queryOptions, _streamStatsDefault)) {
       return submitAndReduceWithStream(context, dispatchableSubPlan, timeoutMs, queryOptions, statsManager);
@@ -246,6 +249,129 @@ public class QueryDispatcher {
         _serversByQuery.remove(requestId);
       }
     }
+  }
+
+  @VisibleForTesting
+  static boolean isStagedDispatch(Map<String, String> queryOptions) {
+    return QueryOptionsUtils.isStagedDispatch(queryOptions);
+  }
+
+  private QueryResult submitAndReduceStaged(RequestContext context, DispatchableSubPlan dispatchableSubPlan,
+      long timeoutMs, Map<String, String> queryOptions, @Nullable ServerRoutingStatsManager statsManager)
+      throws Exception {
+    long requestId = context.getRequestId();
+    long deadlineMs = System.currentTimeMillis() + timeoutMs;
+    Deadline deadline = Deadline.after(timeoutMs, TimeUnit.MILLISECONDS);
+    Set<QueryServerInstance> servers = new HashSet<>();
+    Set<QueryServerInstance> incrementedServers = new HashSet<>();
+    Set<DispatchablePlanFragment> stagePlansWithoutRoot = dispatchableSubPlan.getQueryStagesWithoutRoot();
+    Map<Integer, Set<Integer>> expectedWorkersByStage = expectedWorkersByStage(stagePlansWithoutRoot);
+    Map<Integer, Integer> expectedByStage = new HashMap<>();
+    int totalExpected = 0;
+    for (Map.Entry<Integer, Set<Integer>> entry : expectedWorkersByStage.entrySet()) {
+      int expected = entry.getValue().size();
+      expectedByStage.put(entry.getKey(), expected);
+      totalExpected += expected;
+    }
+    StreamingQuerySession session =
+        new StreamingQuerySession(requestId, totalExpected, expectedWorkersByStage);
+    StageDispatchGraph dispatchGraph = StageDispatchGraph.create(dispatchableSubPlan);
+    QueryResult brokerResult = null;
+
+    try {
+      while (!dispatchGraph.isComplete()) {
+        List<Set<Integer>> readyGroups = dispatchGraph.getReadyGroups();
+        if (readyGroups.isEmpty()) {
+          throw new IllegalStateException("Stage dispatch graph is incomplete but has no ready group");
+        }
+        for (Set<Integer> group : readyGroups) {
+          dispatchGraph.markDispatched(group);
+          Set<Integer> remoteStageIds = new HashSet<>(group);
+          remoteStageIds.remove(0);
+          Set<DispatchablePlanFragment> readyStagePlans =
+              selectStagePlans(stagePlansWithoutRoot, remoteStageIds);
+          submitWithStream(requestId, readyStagePlans, deadline, servers, queryOptions, session);
+
+          if (statsManager != null) {
+            for (QueryServerInstance server : servers) {
+              if (incrementedServers.add(server)) {
+                statsManager.recordStatsForQuerySubmission(requestId, server.getInstanceId());
+              }
+            }
+          }
+
+          if (group.contains(0)) {
+            brokerResult = runReducer(dispatchableSubPlan, queryOptions, _mailboxService);
+            if (brokerResult.getProcessingException() != null) {
+              session.fanOutCancel();
+              long statsWaitMs = Math.min(_statsDrainMs, remainingTimeMs(deadline));
+              session.awaitCompletion(statsWaitMs, TimeUnit.MILLISECONDS);
+              return mergeSessionStatsIntoResult(brokerResult, session, expectedByStage);
+            }
+          }
+
+          if (!remoteStageIds.isEmpty()) {
+            session.awaitSuccessfulStages(remoteStageIds, remainingTimeMs(deadline), TimeUnit.MILLISECONDS);
+            session.awaitStreamsClosed(remainingTimeMs(deadline), TimeUnit.MILLISECONDS);
+          }
+          dispatchGraph.markCompleted(group);
+        }
+      }
+
+      if (brokerResult == null) {
+        throw new IllegalStateException("Stage dispatch graph completed without executing root stage 0");
+      }
+      if (QueryOptionsUtils.isMaterializedExchange(queryOptions)) {
+        validateMaterializedOutputs(requestId, expectedMaterializedOutputs(dispatchableSubPlan),
+            session.getMaterializedOutputs());
+      }
+      return mergeSessionStatsIntoResult(brokerResult, session, expectedByStage);
+    } catch (Exception ex) {
+      return tryRecoverWithStream(session, expectedByStage, deadlineMs, ex);
+    } catch (Throwable e) {
+      session.fanOutCancel();
+      throw e;
+    } finally {
+      if (statsManager != null) {
+        for (QueryServerInstance server : incrementedServers) {
+          statsManager.recordStatsUponResponseArrival(requestId, server.getInstanceId(), -1);
+        }
+      }
+      if (isQueryCancellationEnabled()) {
+        _serversByQuery.remove(requestId);
+      }
+    }
+  }
+
+  private static long remainingTimeMs(Deadline deadline) {
+    return Math.max(0L, deadline.timeRemaining(TimeUnit.MILLISECONDS));
+  }
+
+  private static Map<Integer, Set<Integer>> expectedWorkersByStage(
+      Set<DispatchablePlanFragment> stagePlans) {
+    Map<Integer, Set<Integer>> expectedWorkersByStage = new HashMap<>();
+    for (DispatchablePlanFragment stagePlan : stagePlans) {
+      Set<Integer> workerIds = new HashSet<>();
+      for (List<Integer> serverWorkerIds : stagePlan.getServerInstanceToWorkerIdMap().values()) {
+        workerIds.addAll(serverWorkerIds);
+      }
+      expectedWorkersByStage.put(stagePlan.getPlanFragment().getFragmentId(), workerIds);
+    }
+    return expectedWorkersByStage;
+  }
+
+  private static Set<DispatchablePlanFragment> selectStagePlans(
+      Set<DispatchablePlanFragment> stagePlans, Set<Integer> stageIds) {
+    Set<DispatchablePlanFragment> selected = new HashSet<>();
+    for (DispatchablePlanFragment stagePlan : stagePlans) {
+      if (stageIds.contains(stagePlan.getPlanFragment().getFragmentId())) {
+        selected.add(stagePlan);
+      }
+    }
+    if (selected.size() != stageIds.size()) {
+      throw new IllegalStateException("Unknown non-root stage ids: " + stageIds);
+    }
+    return selected;
   }
 
   /// Streaming variant of [#submitAndReduce]: opens one `SubmitWithStream` bidi RPC per server, runs the
@@ -398,11 +524,19 @@ public class QueryDispatcher {
   void submitWithStream(long requestId, DispatchableSubPlan dispatchableSubPlan, long timeoutMs,
       Set<QueryServerInstance> serversOut, Map<String, String> queryOptions, StreamingQuerySession session)
       throws Exception {
-    Deadline deadline = Deadline.after(timeoutMs, TimeUnit.MILLISECONDS);
+    submitWithStream(requestId, dispatchableSubPlan.getQueryStagesWithoutRoot(),
+        Deadline.after(timeoutMs, TimeUnit.MILLISECONDS), serversOut, queryOptions, session);
+  }
 
-    Set<DispatchablePlanFragment> plansWithoutRoot = dispatchableSubPlan.getQueryStagesWithoutRoot();
-    Map<DispatchablePlanFragment, StageInfo> stageInfos = serializePlanFragments(plansWithoutRoot, serversOut);
-    if (serversOut.isEmpty()) {
+  @VisibleForTesting
+  void submitWithStream(long requestId, Set<DispatchablePlanFragment> stagePlans, Deadline deadline,
+      Set<QueryServerInstance> serversOut, Map<String, String> queryOptions, StreamingQuerySession session)
+      throws Exception {
+    Set<QueryServerInstance> participatingServers = new HashSet<>();
+    Map<DispatchablePlanFragment, StageInfo> stageInfos =
+        serializePlanFragments(stagePlans, participatingServers);
+    serversOut.addAll(participatingServers);
+    if (participatingServers.isEmpty()) {
       return;
     }
 
@@ -413,11 +547,12 @@ public class QueryDispatcher {
     // Per-server expected opchain count = sum across the server's non-root stages of (workers on this server in
     // that stage). The streaming observer uses this to drain the session latch correctly when its stream errors
     // before all opchains have responded.
-    BlockingQueue<AsyncResponse<Worker.QueryResponse>> ackQueue = new ArrayBlockingQueue<>(serversOut.size());
-    for (QueryServerInstance server : serversOut) {
+    BlockingQueue<AsyncResponse<Worker.QueryResponse>> ackQueue =
+        new ArrayBlockingQueue<>(participatingServers.size());
+    for (QueryServerInstance server : participatingServers) {
       Worker.QueryRequest request = createRequest(server, stageInfos, protoRequestMetadata);
       int expectedForServer = 0;
-      for (DispatchablePlanFragment stagePlan : plansWithoutRoot) {
+      for (DispatchablePlanFragment stagePlan : stagePlans) {
         List<Integer> workerIds = stagePlan.getServerInstanceToWorkerIdMap().get(server);
         if (workerIds != null) {
           expectedForServer += workerIds.size();
@@ -437,7 +572,7 @@ public class QueryDispatcher {
       }
     }
 
-    processResults(requestId, serversOut.size(), (response, server) -> {
+    processResults(requestId, participatingServers.size(), (response, server) -> {
       if (response.containsMetadata(ServerResponseStatus.STATUS_ERROR)) {
         session.fanOutCancel();
         throw new RuntimeException(
@@ -447,7 +582,7 @@ public class QueryDispatcher {
     }, deadline, ackQueue);
 
     if (isQueryCancellationEnabled()) {
-      _serversByQuery.put(requestId, serversOut);
+      _serversByQuery.put(requestId, Set.copyOf(serversOut));
     }
   }
 
