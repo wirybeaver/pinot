@@ -171,10 +171,7 @@ public class QueryRunner {
 
     initAggregationSpillConfig(serverConf);
     if (_mseAggregationSpillEnabled) {
-      String configuredRoot = serverConf.getProperty(Server.CONFIG_OF_MSE_AGGREGATION_SPILL_DIR,
-          Paths.get(serverConf.getProperty(Server.CONFIG_OF_INSTANCE_DATA_DIR, Server.DEFAULT_INSTANCE_DATA_DIR),
-              "aggregation-spill").toString());
-      _aggregationSpillDir = Paths.get(configuredRoot, instanceId != null ? instanceId : hostname + "-" + port);
+      _aggregationSpillDir = _aggregationSpillDir.resolve(instanceId != null ? instanceId : hostname + "-" + port);
       AggregationSpillManager.cleanOrphanedSpillFiles(_aggregationSpillDir);
     }
 
@@ -492,9 +489,9 @@ public class QueryRunner {
         Boolean.toString(_mseAggregationSpillEnabled));
     if (_mseAggregationSpillEnabled) {
       opChainMetadata.put(QueryOptionKey.MSE_AGGREGATION_SPILL_DIR, _aggregationSpillDir.toString());
-      opChainMetadata.put(QueryOptionKey.MSE_AGGREGATION_SPILL_MAX_BYTES,
+      opChainMetadata.put(QueryOptionKey.MSE_AGGREGATION_SPILL_MAX_DISK_BYTES,
           Long.toString(_aggregationSpillMaxBytes));
-      opChainMetadata.put(QueryOptionKey.MSE_AGGREGATION_SPILL_SERVER_MAX_BYTES,
+      opChainMetadata.put(QueryOptionKey.MSE_AGGREGATION_SPILL_SERVER_MAX_DISK_BYTES,
           Long.toString(_aggregationSpillServerMaxBytes));
     }
     // 4. add all overrides from config if anything is still empty.

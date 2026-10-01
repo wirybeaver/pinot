@@ -18,7 +18,6 @@
  */
 package org.apache.pinot.query.runtime.operator;
 
-import com.google.common.annotations.VisibleForTesting;
 import java.io.BufferedInputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
@@ -60,8 +59,8 @@ public class AggregationSpillManager implements AutoCloseable {
   private static final String SPILL_FILE_SUFFIX = ".spill";
   private static final String SPILL_SCOPE = "AggregationSpillManager#spill";
   private static final String RESTORE_SCOPE = "AggregationSpillManager#consumePartition";
-  private static final int MAX_BUFFERED_ROWS = 1024;
-  private static final int MAX_BUFFERED_PARTITIONS = 8;
+  private static final int MAX_ROWS_PER_RECORD = 1024;
+  private static final int MAX_BUFFERED_ROWS = 8192;
   private static final Map<String, Long> QUERY_SPILL_BYTES = new HashMap<>();
   private static long _processSpillBytes;
 
@@ -73,30 +72,17 @@ public class AggregationSpillManager implements AutoCloseable {
   private final long _maxSpillBytes;
   private final long _maxServerSpillBytes;
   private final String _queryId;
+  private final long[] _partitionBytes;
   private long _reservedBytes;
-  private final Map<Integer, FileChannel> _spillWriters = new HashMap<>();
+  private final FileChannel[] _spillWriters;
   private final ByteBuffer _recordLengthBuffer = ByteBuffer.allocate(Integer.BYTES);
 
-  public AggregationSpillManager(int numPartitions, int numGroupKeys, DataSchema spillSchema,
-      AggregationFunction[] aggFunctions) {
-    this(numPartitions, numGroupKeys, spillSchema, aggFunctions, Path.of(System.getProperty("java.io.tmpdir")),
-        Server.DEFAULT_MSE_AGGREGATION_SPILL_MAX_BYTES, Server.DEFAULT_MSE_AGGREGATION_SPILL_SERVER_MAX_BYTES, "test");
-  }
-
   AggregationSpillManager(int numPartitions, int numGroupKeys, DataSchema spillSchema,
-      AggregationFunction[] aggFunctions, Path spillRoot, long maxSpillBytes, long maxServerSpillBytes) {
-    this(numPartitions, numGroupKeys, spillSchema, aggFunctions, spillRoot, maxSpillBytes, maxServerSpillBytes, "test");
-  }
-
-  public AggregationSpillManager(int numPartitions, int numGroupKeys, DataSchema spillSchema,
       AggregationFunction[] aggFunctions, Path spillRoot, long maxSpillBytes, long maxServerSpillBytes,
       String queryId) {
     if (numPartitions <= 0 || numPartitions > Server.MAX_MSE_AGGREGATION_SPILL_PARTITIONS) {
       throw new IllegalArgumentException(
           "Number of spill partitions must be between 1 and " + Server.MAX_MSE_AGGREGATION_SPILL_PARTITIONS);
-    }
-    if (numGroupKeys < 0 || numGroupKeys > spillSchema.size()) {
-      throw new IllegalArgumentException("Invalid number of group keys: " + numGroupKeys);
     }
     _numPartitions = numPartitions;
     _numGroupKeys = numGroupKeys;
@@ -105,6 +91,8 @@ public class AggregationSpillManager implements AutoCloseable {
     _maxSpillBytes = maxSpillBytes;
     _maxServerSpillBytes = maxServerSpillBytes;
     _queryId = queryId;
+    _partitionBytes = new long[numPartitions];
+    _spillWriters = new FileChannel[numPartitions];
     try {
       Files.createDirectories(spillRoot);
       _spillDirectory = Files.createTempDirectory(spillRoot, "pinot-aggregation-spill-");
@@ -131,16 +119,11 @@ public class AggregationSpillManager implements AutoCloseable {
 
   SpillResult spill(Iterator<Object[]> rows) {
     List<Object[]>[] partitions = createPartitions();
-    boolean[] touched = new boolean[_numPartitions];
-    int[] touchedPartitions = new int[_numPartitions];
-    int numTouchedPartitions = 0;
     int numRows = 0;
     int numBufferedRows = 0;
     long serializedBytes = 0;
-    int numRowsProcessed = 0;
-    int maxBufferedRows = MAX_BUFFERED_ROWS * Math.min(_numPartitions, MAX_BUFFERED_PARTITIONS);
     while (rows.hasNext()) {
-      QueryThreadContext.checkTerminationAndSampleUsagePeriodically(numRowsProcessed++, SPILL_SCOPE);
+      QueryThreadContext.checkTerminationAndSampleUsagePeriodically(numRows, SPILL_SCOPE);
       Object[] row = rows.next();
       int partitionId = getPartition(row);
       List<Object[]> partition = partitions[partitionId];
@@ -148,102 +131,68 @@ public class AggregationSpillManager implements AutoCloseable {
         partition = new ArrayList<>();
         partitions[partitionId] = partition;
       }
-      if (!touched[partitionId]) {
-        touched[partitionId] = true;
-        touchedPartitions[numTouchedPartitions++] = partitionId;
-      }
       partition.add(row);
       numRows++;
       numBufferedRows++;
-      if (partition.size() == MAX_BUFFERED_ROWS) {
+      if (partition.size() == MAX_ROWS_PER_RECORD) {
         serializedBytes += appendPartition(partitionId, partition);
         partition.clear();
-        numBufferedRows -= MAX_BUFFERED_ROWS;
+        numBufferedRows -= MAX_ROWS_PER_RECORD;
       }
-      if (numBufferedRows >= maxBufferedRows) {
-        serializedBytes += flushPartitions(partitions, touched, touchedPartitions, numTouchedPartitions);
-        numTouchedPartitions = 0;
+      if (numBufferedRows == MAX_BUFFERED_ROWS) {
+        serializedBytes += flushPartitions(partitions);
         numBufferedRows = 0;
       }
     }
-    if (numTouchedPartitions > 0) {
-      serializedBytes += flushPartitions(partitions, touched, touchedPartitions, numTouchedPartitions);
-    }
+    serializedBytes += flushPartitions(partitions);
     return new SpillResult(numRows, serializedBytes);
   }
 
   boolean hasPartition(int partitionId) {
-    checkPartitionId(partitionId);
-    return Files.exists(getSpillFile(partitionId));
+    return _partitionBytes[partitionId] != 0;
   }
 
   /// Consumes all records from a partition and deletes its file after the attempt, including when reading or
   /// processing fails.
   void consumePartition(int partitionId, Consumer<MseBlock.Data> consumer) {
-    checkPartitionId(partitionId);
-    Path spillFile = getSpillFile(partitionId);
-    if (!Files.exists(spillFile)) {
+    if (!hasPartition(partitionId)) {
       return;
     }
+    Path spillFile = getSpillFile(partitionId);
 
-    RuntimeException failure = null;
-    closeSpillWriter(partitionId);
     try (DataInputStream input =
         new DataInputStream(new BufferedInputStream(Files.newInputStream(spillFile)))) {
+      closeSpillWriter(partitionId);
       long remainingBytes = Files.size(spillFile);
       int numRecordsRead = 0;
       while (remainingBytes > 0) {
         QueryThreadContext.checkTerminationAndSampleUsagePeriodically(numRecordsRead++, RESTORE_SCOPE);
-        if (remainingBytes < Integer.BYTES) {
-          throw new IOException("Truncated spill record length in: " + spillFile);
-        }
         int recordLength = input.readInt();
         remainingBytes -= Integer.BYTES;
-        if (recordLength < 0 || recordLength > remainingBytes) {
+        if (recordLength <= 0 || recordLength > remainingBytes) {
           throw new IOException("Invalid spill record length " + recordLength + " in: " + spillFile);
         }
-        byte[] bytes = input.readNBytes(recordLength);
-        if (bytes.length != recordLength) {
-          throw new IOException("Truncated spill record in: " + spillFile);
-        }
+        byte[] bytes = new byte[recordLength];
+        input.readFully(bytes);
         remainingBytes -= recordLength;
-        ByteBuffer buffer = ByteBuffer.wrap(bytes);
-        DataBlock dataBlock = DataBlockUtils.readFrom(buffer);
-        if (buffer.hasRemaining()) {
-          throw new IOException("Trailing bytes in aggregation spill record: " + spillFile);
-        }
+        DataBlock dataBlock = DataBlockUtils.readFrom(ByteBuffer.wrap(bytes));
         consumer.accept(new SerializedDataBlock(dataBlock));
       }
     } catch (IOException e) {
-      failure = new UncheckedIOException("Failed to read aggregation spill partition: " + partitionId, e);
-      throw failure;
-    } catch (RuntimeException e) {
-      failure = e;
-      throw e;
+      throw new UncheckedIOException("Failed to read aggregation spill partition: " + partitionId, e);
     } finally {
       try {
-        deleteSpillFile(spillFile);
-      } catch (RuntimeException e) {
-        if (failure != null) {
-          failure.addSuppressed(e);
-        } else {
-          LOGGER.warn("Failed to delete consumed aggregation spill partition; close will retry: {}", spillFile, e);
-        }
+        Files.deleteIfExists(spillFile);
+        releaseSpillBytes(_partitionBytes[partitionId]);
+        _partitionBytes[partitionId] = 0;
+      } catch (IOException e) {
+        LOGGER.warn("Failed to delete consumed aggregation spill partition; close will retry: {}", spillFile, e);
       }
     }
   }
 
-  int getNumPartitions() {
-    return _numPartitions;
-  }
-
   Path getSpillDirectory() {
     return _spillDirectory;
-  }
-
-  @VisibleForTesting
-  int getNumOpenSpillWriters() {
-    return _spillWriters.size();
   }
 
   @Override
@@ -266,16 +215,8 @@ public class AggregationSpillManager implements AutoCloseable {
       }
     } finally {
       if (!Files.exists(_spillDirectory)) {
-        synchronized (QUERY_SPILL_BYTES) {
-          _processSpillBytes -= _reservedBytes;
-          long remaining = QUERY_SPILL_BYTES.getOrDefault(_queryId, 0L) - _reservedBytes;
-          if (remaining == 0) {
-            QUERY_SPILL_BYTES.remove(_queryId);
-          } else {
-            QUERY_SPILL_BYTES.put(_queryId, remaining);
-          }
-          _reservedBytes = 0;
-        }
+        releaseSpillBytes(_reservedBytes);
+        Arrays.fill(_partitionBytes, 0);
       }
     }
     if (failure != null) {
@@ -313,18 +254,15 @@ public class AggregationSpillManager implements AutoCloseable {
     return new List[_numPartitions];
   }
 
-  private long flushPartitions(List<Object[]>[] partitions, boolean[] touched, int[] touchedPartitions,
-      int numTouchedPartitions) {
+  private long flushPartitions(List<Object[]>[] partitions) {
     long serializedBytes = 0;
-    for (int i = 0; i < numTouchedPartitions; i++) {
-      QueryThreadContext.checkTerminationAndSampleUsagePeriodically(i, SPILL_SCOPE);
-      int partitionId = touchedPartitions[i];
+    for (int partitionId = 0; partitionId < _numPartitions; partitionId++) {
       List<Object[]> partition = partitions[partitionId];
-      if (!partition.isEmpty()) {
+      if (partition != null && !partition.isEmpty()) {
+        QueryThreadContext.checkTerminationAndSampleUsagePeriodically(partitionId, SPILL_SCOPE);
         serializedBytes += appendPartition(partitionId, partition);
         partition.clear();
       }
-      touched[partitionId] = false;
     }
     return serializedBytes;
   }
@@ -339,8 +277,7 @@ public class AggregationSpillManager implements AutoCloseable {
     return Math.floorMod(hash, _numPartitions);
   }
 
-  @VisibleForTesting
-  static int deepHashCode(Object value) {
+  private static int deepHashCode(Object value) {
     if (value instanceof Object[]) {
       return Arrays.deepHashCode((Object[]) value);
     }
@@ -376,7 +313,7 @@ public class AggregationSpillManager implements AutoCloseable {
     try {
       List<ByteBuffer> buffers = dataBlock.serialize();
       int recordLength = getRecordLength(buffers);
-      reserveSpillBytes(Integer.BYTES + (long) recordLength);
+      reserveSpillBytes(partitionId, Integer.BYTES + (long) recordLength);
       FileChannel output = getSpillWriter(partitionId);
       _recordLengthBuffer.clear();
       _recordLengthBuffer.putInt(recordLength).flip();
@@ -390,7 +327,7 @@ public class AggregationSpillManager implements AutoCloseable {
     }
   }
 
-  private void reserveSpillBytes(long bytes) {
+  private void reserveSpillBytes(int partitionId, long bytes) {
     synchronized (QUERY_SPILL_BYTES) {
       long queryBytes = QUERY_SPILL_BYTES.getOrDefault(_queryId, 0L);
       if (bytes > _maxSpillBytes - queryBytes) {
@@ -402,6 +339,20 @@ public class AggregationSpillManager implements AutoCloseable {
       QUERY_SPILL_BYTES.put(_queryId, queryBytes + bytes);
       _processSpillBytes += bytes;
       _reservedBytes += bytes;
+      _partitionBytes[partitionId] += bytes;
+    }
+  }
+
+  private void releaseSpillBytes(long bytes) {
+    synchronized (QUERY_SPILL_BYTES) {
+      _processSpillBytes -= bytes;
+      long remaining = QUERY_SPILL_BYTES.getOrDefault(_queryId, 0L) - bytes;
+      if (remaining == 0) {
+        QUERY_SPILL_BYTES.remove(_queryId);
+      } else {
+        QUERY_SPILL_BYTES.put(_queryId, remaining);
+      }
+      _reservedBytes -= bytes;
     }
   }
 
@@ -410,21 +361,18 @@ public class AggregationSpillManager implements AutoCloseable {
     for (ByteBuffer buffer : buffers) {
       length += buffer.remaining();
     }
-    if (length > Integer.MAX_VALUE) {
-      throw new IllegalStateException("Aggregation spill record exceeds maximum length: " + length);
-    }
-    return (int) length;
+    return Math.toIntExact(length);
   }
 
   private FileChannel getSpillWriter(int partitionId)
       throws IOException {
-    FileChannel writer = _spillWriters.get(partitionId);
+    FileChannel writer = _spillWriters[partitionId];
     if (writer != null) {
       return writer;
     }
     writer = FileChannel.open(getSpillFile(partitionId), StandardOpenOption.CREATE, StandardOpenOption.WRITE,
         StandardOpenOption.APPEND);
-    _spillWriters.put(partitionId, writer);
+    _spillWriters[partitionId] = writer;
     return writer;
   }
 
@@ -435,22 +383,20 @@ public class AggregationSpillManager implements AutoCloseable {
     }
   }
 
-  private void closeSpillWriter(int partitionId) {
-    FileChannel writer = _spillWriters.remove(partitionId);
+  private void closeSpillWriter(int partitionId)
+      throws IOException {
+    FileChannel writer = _spillWriters[partitionId];
     if (writer != null) {
-      try {
-        writer.close();
-      } catch (IOException e) {
-        throw new UncheckedIOException("Failed to close aggregation spill partition: " + partitionId, e);
-      }
+      writer.close();
+      _spillWriters[partitionId] = null;
     }
   }
 
   private void closeSpillWriters() {
     IOException failure = null;
-    for (FileChannel writer : _spillWriters.values()) {
+    for (int partitionId = 0; partitionId < _numPartitions; partitionId++) {
       try {
-        writer.close();
+        closeSpillWriter(partitionId);
       } catch (IOException e) {
         if (failure == null) {
           failure = e;
@@ -459,15 +405,8 @@ public class AggregationSpillManager implements AutoCloseable {
         }
       }
     }
-    _spillWriters.clear();
     if (failure != null) {
       throw new UncheckedIOException("Failed to close aggregation spill files", failure);
-    }
-  }
-
-  private void checkPartitionId(int partitionId) {
-    if (partitionId < 0 || partitionId >= _numPartitions) {
-      throw new IllegalArgumentException("Invalid spill partition id: " + partitionId);
     }
   }
 
@@ -475,29 +414,6 @@ public class AggregationSpillManager implements AutoCloseable {
     return _spillDirectory.resolve(SPILL_FILE_PREFIX + partitionId + SPILL_FILE_SUFFIX);
   }
 
-  void deleteSpillFile(Path spillFile) {
-    try {
-      Files.deleteIfExists(spillFile);
-    } catch (IOException e) {
-      throw new UncheckedIOException("Failed to delete aggregation spill file: " + spillFile, e);
-    }
-  }
-
-  static final class SpillResult {
-    private final int _rows;
-    private final long _serializedBytes;
-
-    SpillResult(int rows, long serializedBytes) {
-      _rows = rows;
-      _serializedBytes = serializedBytes;
-    }
-
-    int getRows() {
-      return _rows;
-    }
-
-    long getBytes() {
-      return _serializedBytes;
-    }
+  record SpillResult(int rows, long bytes) {
   }
 }

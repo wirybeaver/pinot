@@ -934,8 +934,9 @@ public class CommonConstants {
         public static final String MSE_AGGREGATION_SPILL_ENABLED = "mseAggregationSpillEnabled";
         /// Internal server-owned metadata; query-supplied values are overwritten.
         public static final String MSE_AGGREGATION_SPILL_DIR = "mseAggregationSpillDir";
-        public static final String MSE_AGGREGATION_SPILL_MAX_BYTES = "mseAggregationSpillMaxBytes";
-        public static final String MSE_AGGREGATION_SPILL_SERVER_MAX_BYTES = "mseAggregationSpillServerMaxBytes";
+        public static final String MSE_AGGREGATION_SPILL_MAX_DISK_BYTES = "mseAggregationSpillMaxDiskBytes";
+        public static final String MSE_AGGREGATION_SPILL_SERVER_MAX_DISK_BYTES =
+            "mseAggregationSpillServerMaxDiskBytes";
 
         /// Flush threshold for streaming distinct on MSE leaf stages. When positive, the leaf flushes its
         /// accumulated distinct values downstream once they reach this count and starts a fresh table, bounding

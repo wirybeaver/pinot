@@ -96,15 +96,11 @@ public class AggregateOperator extends MultiStageOperator {
   private final StatMap<StatKey> _statMap = new StatMap<>(StatKey.class);
 
   private final boolean _errorOnNumGroupsLimit;
-  private final int _numGroupsLimit;
   private final int _spillTriggerMaxGroups;
-  private final int _restorePartitionMaxGroups;
   private final int _mergeTableInitialCapacity;
   private final int _spillPartitions;
   @Nullable
   private AggregationSpillManager _spillManager;
-  @Nullable
-  private Path _spillDirectory;
   private int _nextSpillPartition;
   private int _numSpilledGroupsProduced;
 
@@ -163,7 +159,6 @@ public class AggregateOperator extends MultiStageOperator {
     _comparator = comparator;
 
     _errorOnNumGroupsLimit = getErrorOnNumGroupsLimit(node.getNodeHint(), context.getOpChainMetadata());
-    _numGroupsLimit = MultistageGroupByExecutor.getNumGroupsLimit(_opChainMetadata, _nodeHint);
     Integer requestedMaxGroups = QueryOptionsUtils.getMSEAggregationSpillMaxGroups(_opChainMetadata);
     Integer requestedPartitions = QueryOptionsUtils.getMSEAggregationSpillPartitions(_opChainMetadata);
     int spillPartitions = requestedPartitions != null
@@ -177,7 +172,6 @@ public class AggregateOperator extends MultiStageOperator {
                   : groupTrimSize != Integer.MAX_VALUE ? "group trimming is active" : "server spill gate is disabled");
     }
     _spillTriggerMaxGroups = spillEligible && requestedMaxGroups != null ? requestedMaxGroups : 0;
-    _restorePartitionMaxGroups = _numGroupsLimit;
     // Uniform distribution is only an initial-capacity hint, not a bound on partition size.
     _mergeTableInitialCapacity = _spillTriggerMaxGroups > 0
         ? (int) Math.max(1L, ((long) _spillTriggerMaxGroups + spillPartitions - 1) / spillPartitions) : 0;
@@ -270,11 +264,6 @@ public class AggregateOperator extends MultiStageOperator {
     try {
       return getNextBlockInternal();
     } catch (Exception e) {
-      try {
-        closeSpillManager();
-      } catch (Exception cleanupException) {
-        e.addSuppressed(cleanupException);
-      }
       releaseBuffers();
       throw e;
     }
@@ -285,11 +274,6 @@ public class AggregateOperator extends MultiStageOperator {
       _eosBlock = _isGroupBy ? consumeGroupBy() : consumeAggregation();
       _inputConsumed = true;
       if (_eosBlock.isError()) {
-        try {
-          closeSpillManager();
-        } catch (Exception e) {
-          LOGGER.warn("Failed to clean up aggregation spill after upstream error", e);
-        }
         releaseBuffers();
         return _eosBlock;
       }
@@ -303,34 +287,42 @@ public class AggregateOperator extends MultiStageOperator {
     }
 
     if (_spillManager != null) {
-      while (_nextSpillPartition < _spillManager.getNumPartitions()) {
+      while (_nextSpillPartition < _spillPartitions) {
         MseBlock.Data block = restoreSpillPartition(_nextSpillPartition++);
         if (block != null) {
           return block;
         }
       }
-      closeSpillManagerQuietly("end of stream");
     }
+    releaseBuffers();
     assert _eosBlock != null;
     return _eosBlock;
   }
 
-  /// Drops the executors, and with them the group-by hash maps and the aggregate result holders they own. Marks the
-  /// operator finished at the same time, so that a later [#getNextBlock()] returns the cached end of stream instead
-  /// of trying to consume the input again with a dropped executor.
+  /// Releases aggregation buffers and spill files on every terminal path without changing already-emitted rows.
   @Override
   protected void releaseBuffers() {
     _aggregationExecutor = null;
     _groupByExecutor = null;
     _inputConsumed = true;
+    _nextSpillPartition = _spillPartitions;
     if (_eosBlock == null) {
       _eosBlock = SuccessMseBlock.INSTANCE;
+    }
+    if (_spillManager != null) {
+      try {
+        _spillManager.close();
+        _spillManager = null;
+      } catch (RuntimeException e) {
+        // Keep the manager so subsequent close/cancel can retry; cleanup must not replace a query error.
+        LOGGER.warn("Failed to clean up aggregation spill at {}", _operatorId, e);
+      }
     }
   }
 
   @Override
   protected boolean hasBufferedState() {
-    return _aggregationExecutor != null || _groupByExecutor != null;
+    return _aggregationExecutor != null || _groupByExecutor != null || _spillManager != null;
   }
 
   private MseBlock produceAggregatedBlock() {
@@ -340,16 +332,14 @@ public class AggregateOperator extends MultiStageOperator {
     } else {
       assert _groupByExecutor != null;
       List<Object[]> rows;
-      int maxRows = _spillTriggerMaxGroups > 0 ? Math.min(_groupTrimSize, _numGroupsLimit) : _groupTrimSize;
       if (_comparator != null) {
-        rows = _groupByExecutor.getResult(_comparator, maxRows);
+        rows = _groupByExecutor.getResult(_comparator, _groupTrimSize);
       } else {
-        rows = _groupByExecutor.getResult(maxRows);
+        rows = _groupByExecutor.getResult(_groupTrimSize);
       }
 
       // Record stat before we check for limit so we can propagate to query response
-      int numGroups = _spillTriggerMaxGroups > 0
-          ? Math.min(_groupByExecutor.getNumGroups(), _numGroupsLimit) : _groupByExecutor.getNumGroups();
+      int numGroups = _groupByExecutor.getNumGroups();
       _statMap.merge(StatKey.NUM_GROUPS, numGroups);
 
       if (rows.isEmpty()) {
@@ -360,9 +350,7 @@ public class AggregateOperator extends MultiStageOperator {
           _statMap.merge(StatKey.GROUPS_TRIMMED, true);
         }
 
-        boolean numGroupsLimitReached = _spillTriggerMaxGroups > 0
-            ? _groupByExecutor.getNumGroups() >= _numGroupsLimit : _groupByExecutor.isNumGroupsLimitReached();
-        if (numGroupsLimitReached) {
+        if (_groupByExecutor.isNumGroupsLimitReached()) {
           if (_errorOnNumGroupsLimit) {
             throw QueryErrorCode.SERVER_RESOURCE_LIMIT_EXCEEDED.asException(
                 "NUM_GROUPS_LIMIT has been reached at: " + _operatorId);
@@ -396,6 +384,7 @@ public class AggregateOperator extends MultiStageOperator {
       _groupByExecutor.processBlock((MseBlock.Data) block);
       if (_groupByExecutor.shouldSpill()) {
         spillCurrentGroups();
+        _groupByExecutor = newInputGroupByExecutor();
       }
       checkTerminationAndSampleUsage();
       block = _input.nextBlock();
@@ -409,24 +398,20 @@ public class AggregateOperator extends MultiStageOperator {
       return;
     }
     if (_spillManager == null) {
-      Path spillRoot = Path.of(_opChainMetadata.getOrDefault(QueryOptionKey.MSE_AGGREGATION_SPILL_DIR,
-          System.getProperty("java.io.tmpdir")));
-      long maxBytes = Long.parseLong(_opChainMetadata.getOrDefault(QueryOptionKey.MSE_AGGREGATION_SPILL_MAX_BYTES,
-          Long.toString(Server.DEFAULT_MSE_AGGREGATION_SPILL_MAX_BYTES)));
+      // QueryRunner supplies the server-owned directory and disk budgets when it enables spill.
+      Path spillRoot = Path.of(_opChainMetadata.get(QueryOptionKey.MSE_AGGREGATION_SPILL_DIR));
+      long maxBytes = Long.parseLong(_opChainMetadata.get(QueryOptionKey.MSE_AGGREGATION_SPILL_MAX_DISK_BYTES));
       long serverMaxBytes =
-          Long.parseLong(_opChainMetadata.getOrDefault(QueryOptionKey.MSE_AGGREGATION_SPILL_SERVER_MAX_BYTES,
-              Long.toString(Server.DEFAULT_MSE_AGGREGATION_SPILL_SERVER_MAX_BYTES)));
+          Long.parseLong(_opChainMetadata.get(QueryOptionKey.MSE_AGGREGATION_SPILL_SERVER_MAX_DISK_BYTES));
       _spillManager = new AggregationSpillManager(_spillPartitions, _groupKeyIds.length, getSpillSchema(),
           _aggFunctions, spillRoot, maxBytes, serverMaxBytes,
           _context.getBrokerId() + ":" + _context.getRequestId());
-      _spillDirectory = _spillManager.getSpillDirectory();
     }
     AggregationSpillManager.SpillResult spillResult =
         _spillManager.spill(_groupByExecutor.getIntermediateResultIterator());
     _statMap.merge(StatKey.SPILL_COUNT, 1L);
-    _statMap.merge(StatKey.SPILLED_ROWS, spillResult.getRows());
-    _statMap.merge(StatKey.SPILLED_BYTES, spillResult.getBytes());
-    _groupByExecutor = newInputGroupByExecutor();
+    _statMap.merge(StatKey.SPILLED_ROWS, spillResult.rows());
+    _statMap.merge(StatKey.SPILLED_BYTES, spillResult.bytes());
   }
 
   private DataSchema getSpillSchema() {
@@ -459,14 +444,14 @@ public class AggregateOperator extends MultiStageOperator {
     _numSpilledGroupsProduced += rows.size();
     _statMap.merge(StatKey.NUM_GROUPS, _numSpilledGroupsProduced);
 
-    if (_numSpilledGroupsProduced >= numGroupsLimit || numGroups >= _restorePartitionMaxGroups) {
+    if (_numSpilledGroupsProduced >= numGroupsLimit) {
       if (_errorOnNumGroupsLimit) {
         throw QueryErrorCode.SERVER_RESOURCE_LIMIT_EXCEEDED.asException(
             "NUM_GROUPS_LIMIT has been reached at: " + _operatorId);
       }
       _statMap.merge(StatKey.NUM_GROUPS_LIMIT_REACHED, true);
       _input.earlyTerminate();
-      _nextSpillPartition = _spillManager.getNumPartitions();
+      _nextSpillPartition = _spillPartitions;
     }
     if (_numSpilledGroupsProduced >= executor.getNumGroupsWarningLimit()) {
       LOGGER.warn("numGroups reached warning limit: {} (actual: {})", executor.getNumGroupsWarningLimit(),
@@ -701,42 +686,9 @@ public class AggregateOperator extends MultiStageOperator {
     return _groupTrimSize;
   }
 
-  @VisibleForTesting
-  @Nullable
-  Path getSpillDirectory() {
-    return _spillDirectory;
-  }
-
-  private void closeSpillManager() {
-    if (_spillManager != null) {
-      _spillManager.close();
-      _spillManager = null;
-    }
-  }
-
-  private void closeSpillManagerQuietly(String action) {
-    try {
-      closeSpillManager();
-    } catch (RuntimeException e) {
-      LOGGER.warn("Failed to clean up aggregation spill during {}", action, e);
-    }
-  }
-
   @Override
   protected void earlyTerminate() {
-    closeSpillManagerQuietly("early termination");
+    releaseBuffers();
     super.earlyTerminate();
-  }
-
-  @Override
-  public void close() {
-    closeSpillManagerQuietly("close");
-    super.close();
-  }
-
-  @Override
-  public void cancel(Throwable e) {
-    closeSpillManagerQuietly("cancellation");
-    super.cancel(e);
   }
 }
