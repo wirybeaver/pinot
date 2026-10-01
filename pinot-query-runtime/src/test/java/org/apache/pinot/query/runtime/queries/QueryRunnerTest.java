@@ -20,6 +20,9 @@ package org.apache.pinot.query.runtime.queries;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -28,6 +31,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import javax.annotation.Nullable;
+import org.apache.commons.io.FileUtils;
 import org.apache.pinot.common.response.broker.ResultTable;
 import org.apache.pinot.query.QueryEnvironmentTestBase;
 import org.apache.pinot.query.QueryServerEnclosure;
@@ -46,6 +50,7 @@ import org.apache.pinot.spi.data.readers.GenericRow;
 import org.apache.pinot.spi.env.PinotConfiguration;
 import org.apache.pinot.spi.utils.CommonConstants.Broker.Request.QueryOptionKey;
 import org.apache.pinot.spi.utils.CommonConstants.MultiStageQueryRunner;
+import org.apache.pinot.spi.utils.CommonConstants.Server;
 import org.apache.pinot.spi.utils.JsonUtils;
 import org.apache.pinot.spi.utils.builder.TableNameBuilder;
 import org.apache.pinot.sql.parsers.rewriter.RlsUtils;
@@ -61,6 +66,7 @@ import org.testng.annotations.Test;
 /// all special tests that doesn't fit into [org.apache.pinot.query.runtime.queries.ResourceBasedQueriesTest]
 /// pattern goes here.
 public class QueryRunnerTest extends QueryRunnerTestBase {
+  private Path _spillRoot;
   //@formatter:off
   public static final Object[][] ROWS = new Object[][]{
       new Object[]{"foo", "foo", 1},
@@ -97,12 +103,14 @@ public class QueryRunnerTest extends QueryRunnerTestBase {
   }
 
   protected Map<String, Object> getConfiguration() {
-    return Map.of();
+    return Map.of(Server.CONFIG_OF_MSE_AGGREGATION_SPILL_ENABLED, true,
+        Server.CONFIG_OF_MSE_AGGREGATION_SPILL_DIR, _spillRoot.toString());
   }
 
   @BeforeClass
   public void setUp()
       throws Exception {
+    _spillRoot = Files.createTempDirectory("query-runner-spill-");
     MockInstanceDataManagerFactory factory1 = new MockInstanceDataManagerFactory("server1");
     factory1.registerTable(SCHEMA_BUILDER.setSchemaName("a").build(), "a_REALTIME");
     factory1.registerTable(SCHEMA_BUILDER.setSchemaName("b").build(), "b_REALTIME");
@@ -162,11 +170,13 @@ public class QueryRunnerTest extends QueryRunnerTestBase {
   }
 
   @AfterClass
-  public void tearDown() {
+  public void tearDown()
+      throws IOException {
     for (QueryServerEnclosure server : _servers.values()) {
       server.shutDown();
     }
     _mailboxService.shutdown();
+    FileUtils.deleteDirectory(_spillRoot.toFile());
   }
 
   /// The self stats of a node are the node's own value minus its children's. A mailbox send reports its stats from
@@ -185,6 +195,46 @@ public class QueryRunnerTest extends QueryRunnerTestBase {
 
     int checked = assertSelfStatsAreNotNegative(statsTree);
     Assert.assertTrue(checked > 0, "expected some self stats to check, got: " + statsTree);
+  }
+
+  @DataProvider(name = "spillQueries")
+  public Object[][] spillQueries() {
+    return new Object[][]{
+        {"SELECT col1, SUM(col3), AVG(col3) FROM a GROUP BY col1 ORDER BY col1", 5},
+        {"SELECT col2, DISTINCTCOUNT(col3) FROM a GROUP BY col2 ORDER BY col2", 3}
+    };
+  }
+
+  @Test(dataProvider = "spillQueries")
+  public void testMSEAggregationSpill(String query, int expectedGroups)
+      throws IOException {
+    ResultTable expected = queryRunner(query, false).getResultTable();
+    String spillQuery =
+        "SET mseAggregationSpillMaxGroups = 2; SET mseAggregationSpillPartitions = 8; " + query;
+    QueryDispatcher.QueryResult queryResult = queryRunner(spillQuery, true);
+    ResultTable actual = queryResult.getResultTable();
+
+    Assertions.assertThat(actual.getDataSchema()).isEqualTo(expected.getDataSchema());
+    Assertions.assertThat(actual.getRows()).hasSize(expectedGroups).containsExactlyElementsOf(expected.getRows());
+
+    Map<Integer, DispatchablePlanFragment> planNodes = planQuery(spillQuery).getQueryPlan().getQueryStageMap();
+    ObjectNode statsTree =
+        new MultiStageStatsTreeBuilder(planNodes, queryResult.getQueryStats()).jsonStatsByStage(1);
+    ObjectNode spillStats = findFieldOwner(statsTree, "spillCount");
+    Assertions.assertThat(spillStats).isNotNull();
+    Assertions.assertThat(spillStats.path("spillCount").asLong()).isPositive();
+    Assertions.assertThat(spillStats.path("spilledRows").asLong()).isPositive();
+    Assertions.assertThat(spillStats.path("spilledBytes").asLong()).isPositive();
+
+    try (var instances = Files.list(_spillRoot)) {
+      List<Path> instanceRoots = instances.toList();
+      Assertions.assertThat(instanceRoots).isNotEmpty();
+      for (Path instanceRoot : instanceRoots) {
+        try (var directories = Files.list(instanceRoot)) {
+          Assertions.assertThat(directories).isEmpty();
+        }
+      }
+    }
   }
 
   /// Asserts that no self stat in the tree is negative, and returns how many were checked.
