@@ -19,7 +19,9 @@
 package org.apache.pinot.query.runtime;
 
 import java.util.Map;
+import org.apache.pinot.spi.env.PinotConfiguration;
 import org.apache.pinot.spi.utils.CommonConstants.Broker.Request.QueryOptionKey;
+import org.apache.pinot.spi.utils.CommonConstants.Server;
 import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
@@ -38,8 +40,40 @@ public class QueryRunnerMetadataTest {
   public void testServerSpillGateOverridesUserMetadata(Map<String, String> customProperties,
       Map<String, String> requestMetadata) {
     QueryRunner queryRunner = new QueryRunner();
+    queryRunner.initAggregationSpillConfig(new PinotConfiguration());
     Map<String, String> metadata = queryRunner.consolidateMetadata(customProperties, requestMetadata);
 
     assertEquals(metadata.get(QueryOptionKey.MSE_AGGREGATION_SPILL_ENABLED), "false");
+  }
+
+  @Test
+  public void testConfiguredSpillGateOverridesRequestMetadata() {
+    QueryRunner queryRunner = new QueryRunner();
+    queryRunner.initAggregationSpillConfig(
+        new PinotConfiguration(Map.of(Server.CONFIG_OF_MSE_AGGREGATION_SPILL_ENABLED, true)));
+
+    Map<String, String> metadata =
+        queryRunner.consolidateMetadata(Map.of(), Map.of(QueryOptionKey.MSE_AGGREGATION_SPILL_ENABLED, "false"));
+    assertEquals(metadata.get(QueryOptionKey.MSE_AGGREGATION_SPILL_ENABLED), "true");
+  }
+
+  @Test
+  public void testSpillLocationAndBudgetsAreServerOwned() {
+    QueryRunner queryRunner = new QueryRunner();
+    queryRunner.initAggregationSpillConfig(new PinotConfiguration(Map.of(
+        Server.CONFIG_OF_MSE_AGGREGATION_SPILL_ENABLED, true,
+        Server.CONFIG_OF_MSE_AGGREGATION_SPILL_DIR, "/srv/pinot-spill",
+        Server.CONFIG_OF_MSE_AGGREGATION_SPILL_MAX_BYTES, 1024,
+        Server.CONFIG_OF_MSE_AGGREGATION_SPILL_SERVER_MAX_BYTES, 2048)));
+    Map<String, String> untrusted = Map.of(
+        QueryOptionKey.MSE_AGGREGATION_SPILL_DIR, "/tmp/untrusted",
+        QueryOptionKey.MSE_AGGREGATION_SPILL_MAX_DISK_BYTES, "100000",
+        QueryOptionKey.MSE_AGGREGATION_SPILL_SERVER_MAX_DISK_BYTES, "100000");
+
+    Map<String, String> metadata = queryRunner.consolidateMetadata(untrusted, Map.of());
+
+    assertEquals(metadata.get(QueryOptionKey.MSE_AGGREGATION_SPILL_DIR), "/srv/pinot-spill");
+    assertEquals(metadata.get(QueryOptionKey.MSE_AGGREGATION_SPILL_MAX_DISK_BYTES), "1024");
+    assertEquals(metadata.get(QueryOptionKey.MSE_AGGREGATION_SPILL_SERVER_MAX_DISK_BYTES), "2048");
   }
 }

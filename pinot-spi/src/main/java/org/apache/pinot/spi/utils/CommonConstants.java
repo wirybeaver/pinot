@@ -1634,6 +1634,17 @@ public class CommonConstants {
     public static final String CONFIG_OF_MSE_MIN_GROUP_TRIM_SIZE = MSE_CONFIG_PREFIX + ".min.group.trim.size";
     // Match the value of GroupByUtils.DEFAULT_MIN_NUM_GROUPS
     public static final int DEFAULT_MSE_MIN_GROUP_TRIM_SIZE = 5000;
+    // Aggregation spill is disabled by default; the stat decoders drop unknown keys on mixed-version clusters.
+    public static final String CONFIG_OF_MSE_AGGREGATION_SPILL_ENABLED =
+        MSE_CONFIG_PREFIX + ".aggregation.spill.enabled";
+    public static final boolean DEFAULT_MSE_AGGREGATION_SPILL_ENABLED = false;
+    public static final String CONFIG_OF_MSE_AGGREGATION_SPILL_DIR = MSE_CONFIG_PREFIX + ".aggregation.spill.dir";
+    public static final String CONFIG_OF_MSE_AGGREGATION_SPILL_MAX_BYTES =
+        MSE_CONFIG_PREFIX + ".aggregation.spill.max.bytes";
+    public static final String CONFIG_OF_MSE_AGGREGATION_SPILL_SERVER_MAX_BYTES =
+        MSE_CONFIG_PREFIX + ".aggregation.spill.server.max.bytes";
+    public static final long DEFAULT_MSE_AGGREGATION_SPILL_MAX_BYTES = 1L << 30;
+    public static final long DEFAULT_MSE_AGGREGATION_SPILL_SERVER_MAX_BYTES = 8L << 30;
     public static final int DEFAULT_MSE_AGGREGATION_SPILL_PARTITIONS = 8;
     public static final int MAX_MSE_AGGREGATION_SPILL_PARTITIONS = 64;
 

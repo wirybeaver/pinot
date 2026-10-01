@@ -21,6 +21,8 @@ package org.apache.pinot.query.runtime;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import io.grpc.stub.StreamObserver;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -55,6 +57,7 @@ import org.apache.pinot.query.routing.WorkerMetadata;
 import org.apache.pinot.query.runtime.blocks.ErrorMseBlock;
 import org.apache.pinot.query.runtime.executor.OpChainCompletionListener;
 import org.apache.pinot.query.runtime.executor.OpChainSchedulerService;
+import org.apache.pinot.query.runtime.operator.AggregationSpillManager;
 import org.apache.pinot.query.runtime.operator.ExplainableOperator;
 import org.apache.pinot.query.runtime.operator.MultiStageOperator;
 import org.apache.pinot.query.runtime.operator.OpChain;
@@ -111,6 +114,10 @@ public class QueryRunner {
   private Integer _numGroupsWarningLimit;
   @Nullable
   private Integer _mseMinGroupTrimSize;
+  private boolean _mseAggregationSpillEnabled;
+  private Path _aggregationSpillDir;
+  private long _aggregationSpillMaxBytes;
+  private long _aggregationSpillServerMaxBytes;
 
   @Nullable
   private Integer _maxInitialResultHolderCapacity;
@@ -161,6 +168,12 @@ public class QueryRunner {
 
     String mseMinGroupTrimSizeStr = serverConf.getProperty(Server.CONFIG_OF_MSE_MIN_GROUP_TRIM_SIZE);
     _mseMinGroupTrimSize = mseMinGroupTrimSizeStr != null ? Integer.parseInt(mseMinGroupTrimSizeStr) : null;
+
+    initAggregationSpillConfig(serverConf);
+    if (_mseAggregationSpillEnabled) {
+      _aggregationSpillDir = _aggregationSpillDir.resolve(instanceId != null ? instanceId : hostname + "-" + port);
+      AggregationSpillManager.cleanOrphanedSpillFiles(_aggregationSpillDir);
+    }
 
     String maxInitialGroupHolderCapacity =
         serverConf.getProperty(Server.CONFIG_OF_QUERY_EXECUTOR_MAX_INITIAL_RESULT_HOLDER_CAPACITY);
@@ -296,12 +309,12 @@ public class QueryRunner {
   private void processQueryBlocking(WorkerMetadata workerMetadata, StagePlan stagePlan,
       Map<String, String> requestMetadata) {
     StageMetadata stageMetadata = stagePlan.getStageMetadata();
-    Map<String, String> opChainMetadata = consolidateMetadata(stageMetadata.getCustomProperties(), requestMetadata);
 
     // The cluster-level _sendStats decision can be overridden per-request by the SubmitWithStream RPC handler via
     // MultiStageQueryRunner.KEY_OF_STATS_REPORTING_MODE; in stream mode stats travel out-of-band
     // and we suppress the mailbox-side path to avoid duplication.
     boolean sendStats = effectiveSendStats(requestMetadata);
+    Map<String, String> opChainMetadata = consolidateMetadata(stageMetadata.getCustomProperties(), requestMetadata);
 
     // run pre-stage execution for all pipeline breakers
     PipelineBreakerResult pipelineBreakerResult = PipelineBreakerExecutor.executePipelineBreakers(
@@ -472,8 +485,15 @@ public class QueryRunner {
     if (_numGroupsWarningLimit != null) {
       opChainMetadata.put(QueryOptionKey.NUM_GROUPS_WARNING_LIMIT, Integer.toString(_numGroupsWarningLimit));
     }
-    // Keep production spill disabled until the server-owned configuration is wired in.
-    opChainMetadata.put(QueryOptionKey.MSE_AGGREGATION_SPILL_ENABLED, "false");
+    opChainMetadata.put(QueryOptionKey.MSE_AGGREGATION_SPILL_ENABLED,
+        Boolean.toString(_mseAggregationSpillEnabled));
+    if (_mseAggregationSpillEnabled) {
+      opChainMetadata.put(QueryOptionKey.MSE_AGGREGATION_SPILL_DIR, _aggregationSpillDir.toString());
+      opChainMetadata.put(QueryOptionKey.MSE_AGGREGATION_SPILL_MAX_DISK_BYTES,
+          Long.toString(_aggregationSpillMaxBytes));
+      opChainMetadata.put(QueryOptionKey.MSE_AGGREGATION_SPILL_SERVER_MAX_DISK_BYTES,
+          Long.toString(_aggregationSpillServerMaxBytes));
+    }
     // 4. add all overrides from config if anything is still empty.
     Integer numGroupsLimit = QueryOptionsUtils.getNumGroupsLimit(opChainMetadata);
     if (numGroupsLimit == null) {
@@ -551,6 +571,22 @@ public class QueryRunner {
     }
 
     return opChainMetadata;
+  }
+
+  @VisibleForTesting
+  void initAggregationSpillConfig(PinotConfiguration serverConf) {
+    _mseAggregationSpillEnabled = serverConf.getProperty(Server.CONFIG_OF_MSE_AGGREGATION_SPILL_ENABLED,
+        Server.DEFAULT_MSE_AGGREGATION_SPILL_ENABLED);
+    _aggregationSpillDir = Paths.get(serverConf.getProperty(Server.CONFIG_OF_MSE_AGGREGATION_SPILL_DIR,
+        Paths.get(serverConf.getProperty(Server.CONFIG_OF_INSTANCE_DATA_DIR, Server.DEFAULT_INSTANCE_DATA_DIR),
+            "aggregation-spill").toString()));
+    _aggregationSpillMaxBytes = serverConf.getProperty(Server.CONFIG_OF_MSE_AGGREGATION_SPILL_MAX_BYTES,
+        Server.DEFAULT_MSE_AGGREGATION_SPILL_MAX_BYTES);
+    _aggregationSpillServerMaxBytes = serverConf.getProperty(Server.CONFIG_OF_MSE_AGGREGATION_SPILL_SERVER_MAX_BYTES,
+        Server.DEFAULT_MSE_AGGREGATION_SPILL_SERVER_MAX_BYTES);
+    if (_aggregationSpillMaxBytes <= 0 || _aggregationSpillServerMaxBytes <= 0) {
+      throw new IllegalArgumentException("Aggregation spill byte limits must be positive");
+    }
   }
 
   public MailboxService getMailboxService() {
