@@ -18,6 +18,7 @@
  */
 package org.apache.pinot.query.runtime;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import io.grpc.stub.StreamObserver;
 import java.time.Duration;
@@ -459,7 +460,8 @@ public class QueryRunner {
     }
   }
 
-  private Map<String, String> consolidateMetadata(Map<String, String> customProperties,
+  @VisibleForTesting
+  Map<String, String> consolidateMetadata(Map<String, String> customProperties,
       Map<String, String> requestMetadata) {
     Map<String, String> opChainMetadata = new HashMap<>();
     // 1. put all request level metadata
@@ -470,6 +472,8 @@ public class QueryRunner {
     if (_numGroupsWarningLimit != null) {
       opChainMetadata.put(QueryOptionKey.NUM_GROUPS_WARNING_LIMIT, Integer.toString(_numGroupsWarningLimit));
     }
+    // Keep production spill disabled until the server-owned configuration is wired in.
+    opChainMetadata.put(QueryOptionKey.MSE_AGGREGATION_SPILL_ENABLED, "false");
     // 4. add all overrides from config if anything is still empty.
     Integer numGroupsLimit = QueryOptionsUtils.getNumGroupsLimit(opChainMetadata);
     if (numGroupsLimit == null) {

@@ -919,6 +919,25 @@ public class CommonConstants {
         /// Flush threshold for streaming group-by on MSE leaf stages.
         public static final String STREAMING_GROUP_BY_FLUSH_THRESHOLD = "streamingGroupByFlushThreshold";
 
+        /// Number of groups retained before a keyed MSE aggregation spills. Group count is a v1 proxy for memory
+        /// consumption, not a byte budget. An absent value disables spilling. This option requires the server gate,
+        /// and does not apply to global aggregation, leaf-final-result, or plans with a pushed-down LIMIT that
+        /// enables group trimming. See https://github.com/apache/pinot/issues/19666 for a memory-based trigger.
+        public static final String MSE_AGGREGATION_SPILL_MAX_GROUPS = "mseAggregationSpillMaxGroups";
+
+        /// Number of hash partitions used by MSE aggregation spilling. Must be between 1 and
+        /// [Server#MAX_MSE_AGGREGATION_SPILL_PARTITIONS].
+        public static final String MSE_AGGREGATION_SPILL_PARTITIONS = "mseAggregationSpillPartitions";
+
+        /// Internal metadata populated from the server-level MSE aggregation spill gate. Query-supplied values are
+        /// overwritten by the server.
+        public static final String MSE_AGGREGATION_SPILL_ENABLED = "mseAggregationSpillEnabled";
+        /// Internal server-owned metadata; query-supplied values are overwritten.
+        public static final String MSE_AGGREGATION_SPILL_DIR = "mseAggregationSpillDir";
+        public static final String MSE_AGGREGATION_SPILL_MAX_DISK_BYTES = "mseAggregationSpillMaxDiskBytes";
+        public static final String MSE_AGGREGATION_SPILL_SERVER_MAX_DISK_BYTES =
+            "mseAggregationSpillServerMaxDiskBytes";
+
         /// Flush threshold for streaming distinct on MSE leaf stages. When positive, the leaf flushes its
         /// accumulated distinct values downstream once they reach this count and starts a fresh table, bounding
         /// server memory and pushing the residual de-duplication into the partitioned intermediate stage.
@@ -1615,6 +1634,7 @@ public class CommonConstants {
     public static final String CONFIG_OF_MSE_MIN_GROUP_TRIM_SIZE = MSE_CONFIG_PREFIX + ".min.group.trim.size";
     // Match the value of GroupByUtils.DEFAULT_MIN_NUM_GROUPS
     public static final int DEFAULT_MSE_MIN_GROUP_TRIM_SIZE = 5000;
+    public static final int DEFAULT_MSE_AGGREGATION_SPILL_PARTITIONS = 8;
     public static final int MAX_MSE_AGGREGATION_SPILL_PARTITIONS = 64;
 
     // TODO: Merge this with "mse"
