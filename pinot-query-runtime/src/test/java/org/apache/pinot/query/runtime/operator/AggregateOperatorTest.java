@@ -18,12 +18,21 @@
  */
 package org.apache.pinot.query.runtime.operator;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import javax.annotation.Nullable;
 import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.sql.SqlKind;
+import org.apache.commons.io.FileUtils;
 import org.apache.pinot.calcite.rel.hint.PinotHintOptions;
 import org.apache.pinot.common.datatable.StatMap;
 import org.apache.pinot.common.utils.DataSchema;
@@ -39,17 +48,22 @@ import org.apache.pinot.query.runtime.blocks.SuccessMseBlock;
 import org.apache.pinot.query.runtime.plan.MultiStageQueryStats;
 import org.apache.pinot.query.runtime.plan.OpChainExecutionContext;
 import org.apache.pinot.spi.exception.QueryErrorCode;
+import org.apache.pinot.spi.utils.ByteArray;
 import org.apache.pinot.spi.utils.CommonConstants.Broker.Request.QueryOptionKey;
 import org.apache.pinot.spi.utils.CommonConstants.Server;
 import org.mockito.Mock;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
+import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
 import static org.apache.pinot.common.utils.DataSchema.ColumnDataType.BOOLEAN;
+import static org.apache.pinot.common.utils.DataSchema.ColumnDataType.BYTES;
 import static org.apache.pinot.common.utils.DataSchema.ColumnDataType.DOUBLE;
 import static org.apache.pinot.common.utils.DataSchema.ColumnDataType.INT;
+import static org.apache.pinot.common.utils.DataSchema.ColumnDataType.OBJECT;
 import static org.apache.pinot.common.utils.DataSchema.ColumnDataType.STRING;
+import static org.apache.pinot.common.utils.DataSchema.ColumnDataType.UUID;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -61,13 +75,16 @@ import static org.testng.Assert.assertTrue;
 
 public class AggregateOperatorTest {
   private AutoCloseable _mocks;
+  private Path _spillRoot;
   @Mock
   private MultiStageOperator _input;
   @Mock
   private VirtualServerAddress _serverAddress;
 
   @BeforeMethod
-  public void setUp() {
+  public void setUp()
+      throws IOException {
+    _spillRoot = Files.createTempDirectory("aggregate-operator-spill-");
     _mocks = openMocks(this);
     when(_serverAddress.toString()).thenReturn(new VirtualServerAddress("mock", 80, 0).toString());
   }
@@ -75,6 +92,7 @@ public class AggregateOperatorTest {
   @AfterMethod
   public void tearDown()
       throws Exception {
+    FileUtils.deleteDirectory(_spillRoot.toFile());
     _mocks.close();
   }
 
@@ -162,6 +180,378 @@ public class AggregateOperatorTest {
     StatMap<AggregateOperator.StatKey> statMap = OperatorTestUtil.getStatMap(AggregateOperator.StatKey.class, stats);
     assertEquals(statMap.getLong(AggregateOperator.StatKey.NUM_GROUPS), 1,
         "Num groups should equal the number of distinct group keys");
+  }
+
+  @Test
+  public void testGroupBySpillProducesExactResultsAndCleansUp()
+      throws IOException {
+    List<RexExpression.FunctionCall> aggCalls = List.of(getSum(new RexExpression.InputRef(1)));
+    List<Integer> filterArgs = List.of(-1);
+    List<Integer> groupKeys = List.of(0);
+    DataSchema inputSchema = new DataSchema(new String[]{"group", "arg"}, new ColumnDataType[]{INT, DOUBLE});
+    _input = new BlockListMultiStageOperator.Builder(inputSchema)
+        .addRow(1, 1.0)
+        .addRow(2, 2.0)
+        .finishBlock()
+        .addRow(1, 3.0)
+        .addRow(3, 4.0)
+        .finishBlock()
+        .addRow(2, 5.0)
+        .addRow(4, 6.0)
+        .buildWithEos();
+    DataSchema resultSchema = new DataSchema(new String[]{"group", "sum"}, new ColumnDataType[]{INT, DOUBLE});
+    AggregateOperator operator = getOperator(resultSchema, aggCalls, filterArgs, groupKeys, PlanNode.NodeHint.EMPTY,
+        spillOptions(2, 2));
+
+    List<Object[]> resultRows = drainRows(operator);
+
+    resultRows.sort((left, right) -> Integer.compare((int) left[0], (int) right[0]));
+    assertEquals(resultRows.size(), 4);
+    assertEquals(resultRows.get(0), new Object[]{1, 4.0});
+    assertEquals(resultRows.get(1), new Object[]{2, 7.0});
+    assertEquals(resultRows.get(2), new Object[]{3, 4.0});
+    assertEquals(resultRows.get(3), new Object[]{4, 6.0});
+    assertEquals(spillDirectoryCount(), 0L);
+
+    StatMap<AggregateOperator.StatKey> statMap =
+        OperatorTestUtil.getStatMap(AggregateOperator.StatKey.class, operator.calculateStats());
+    assertEquals(statMap.getLong(AggregateOperator.StatKey.NUM_GROUPS), 4);
+    assertEquals(statMap.getLong(AggregateOperator.StatKey.SPILL_COUNT), 3);
+    assertEquals(statMap.getLong(AggregateOperator.StatKey.SPILLED_ROWS), 6);
+    assertTrue(statMap.getLong(AggregateOperator.StatKey.SPILLED_BYTES) > 0);
+  }
+
+  @Test
+  public void testSpillMergesArrayKeyAcrossRuns() {
+    DataSchema inputSchema = new DataSchema(new String[]{"key", "value"},
+        new ColumnDataType[]{ColumnDataType.STRING_ARRAY, DOUBLE});
+    _input = new BlockListMultiStageOperator.Builder(inputSchema)
+        .addRow(new String[]{"a", "b"}, 1.0)
+        .finishBlock()
+        .addRow(new String[]{"a", "b"}, 2.0)
+        .buildWithEos();
+    DataSchema resultSchema = new DataSchema(new String[]{"key", "sum"},
+        new ColumnDataType[]{ColumnDataType.STRING_ARRAY, DOUBLE});
+    AggregateOperator operator = getOperator(resultSchema, List.of(getSum(new RexExpression.InputRef(1))),
+        List.of(-1), List.of(0), PlanNode.NodeHint.EMPTY, spillOptions(1, 8));
+
+    List<Object[]> rows = drainRows(operator);
+    assertEquals(rows.size(), 1);
+    assertEquals(rows.get(0)[0], new String[]{"a", "b"});
+    assertEquals(rows.get(0)[1], 3.0);
+  }
+
+  @Test
+  public void testDistinctGroupBySpill() {
+    DataSchema inputSchema = new DataSchema(new String[]{"group"}, new ColumnDataType[]{INT});
+    _input = new BlockListMultiStageOperator.Builder(inputSchema)
+        .addRow(1)
+        .finishBlock()
+        .addRow(2)
+        .finishBlock()
+        .addRow(1)
+        .buildWithEos();
+    AggregateOperator operator =
+        getOperator(inputSchema, List.of(), List.of(), List.of(0), PlanNode.NodeHint.EMPTY,
+            spillOptions(1, Server.DEFAULT_MSE_AGGREGATION_SPILL_PARTITIONS));
+
+    List<Object[]> resultRows = drainRows(operator);
+
+    resultRows.sort((left, right) -> Integer.compare((int) left[0], (int) right[0]));
+    assertEquals(resultRows.size(), 2);
+    assertEquals(resultRows.get(0), new Object[]{1});
+    assertEquals(resultRows.get(1), new Object[]{2});
+  }
+
+  @Test
+  public void testGroupBySpillSupportsCompositeNullKeysAndFilters() {
+    List<RexExpression.FunctionCall> aggCalls = List.of(getSum(new RexExpression.InputRef(2)));
+    DataSchema inputSchema = new DataSchema(new String[]{"group", "subgroup", "arg", "filter"},
+        new ColumnDataType[]{INT, STRING, DOUBLE, BOOLEAN});
+    _input = new BlockListMultiStageOperator.Builder(inputSchema)
+        .addRow(1, null, 1.0, 1)
+        .addRow(1, "x", 10.0, 1)
+        .finishBlock()
+        .addRow(1, null, 2.0, 0)
+        .addRow(1, "x", 5.0, 1)
+        .buildWithEos();
+    DataSchema resultSchema =
+        new DataSchema(new String[]{"group", "subgroup", "sum"}, new ColumnDataType[]{INT, STRING, DOUBLE});
+    AggregateOperator operator =
+        getOperator(resultSchema, aggCalls, List.of(3), List.of(0, 1), PlanNode.NodeHint.EMPTY,
+            spillOptions(1, Server.MAX_MSE_AGGREGATION_SPILL_PARTITIONS));
+
+    List<Object[]> resultRows = drainRows(operator);
+    resultRows.sort((left, right) -> {
+      String leftKey = (String) left[1];
+      String rightKey = (String) right[1];
+      if (leftKey == null) {
+        return rightKey == null ? 0 : -1;
+      }
+      return rightKey == null ? 1 : leftKey.compareTo(rightKey);
+    });
+
+    assertEquals(resultRows.size(), 2);
+    assertEquals(resultRows.get(0), new Object[]{1, null, 1.0});
+    assertEquals(resultRows.get(1), new Object[]{1, "x", 15.0});
+  }
+
+  @Test
+  public void testSpillPreservesIntermediateAndFinalAggregationModes() {
+    RexExpression.FunctionCall avgCall =
+        new RexExpression.FunctionCall(DOUBLE, SqlKind.AVG.name(), List.of(new RexExpression.InputRef(1)));
+    Map<String, String> spillOptions = spillOptions(1, 2);
+    DataSchema inputSchema = new DataSchema(new String[]{"group", "arg"}, new ColumnDataType[]{INT, DOUBLE});
+    _input = new BlockListMultiStageOperator.Builder(inputSchema)
+        .addRow(1, 1.0)
+        .addRow(2, 10.0)
+        .finishBlock()
+        .addRow(1, 3.0)
+        .addRow(2, 20.0)
+        .buildWithEos();
+    DataSchema intermediateSchema =
+        new DataSchema(new String[]{"group", "avg"}, new ColumnDataType[]{INT, OBJECT});
+
+    AggregateOperator leafOperator =
+        getOperator(intermediateSchema, List.of(avgCall), List.of(-1), List.of(0), AggType.LEAF, spillOptions);
+    _input = new BlockListMultiStageOperator(OperatorTestUtil.getTracingContext(), drainDataBlocks(leafOperator));
+    AggregateOperator intermediateOperator =
+        getOperator(intermediateSchema, List.of(avgCall), List.of(-1), List.of(0), AggType.INTERMEDIATE, spillOptions);
+    _input =
+        new BlockListMultiStageOperator(OperatorTestUtil.getTracingContext(), drainDataBlocks(intermediateOperator));
+    DataSchema finalSchema = new DataSchema(new String[]{"group", "avg"}, new ColumnDataType[]{INT, DOUBLE});
+    AggregateOperator finalOperator =
+        getOperator(finalSchema, List.of(avgCall), List.of(-1), List.of(0), AggType.FINAL, spillOptions);
+
+    List<Object[]> resultRows = drainRows(finalOperator);
+    resultRows.sort((left, right) -> Integer.compare((int) left[0], (int) right[0]));
+    assertEquals(resultRows.size(), 2);
+    assertEquals(resultRows.get(0), new Object[]{1, 2.0});
+    assertEquals(resultRows.get(1), new Object[]{2, 15.0});
+  }
+
+  @DataProvider(name = "spillGroupLimits")
+  public Object[][] spillGroupLimits() {
+    return new Object[][]{{1, 1, false}, {1, 1, true}, {100, 3, false}, {100, 3, true}};
+  }
+
+  @Test(dataProvider = "spillGroupLimits")
+  public void testSpillPreservesGroupLimit(int trigger, int rowsPerBlock, boolean errorOnLimit)
+      throws IOException {
+    DataSchema schema = new DataSchema(new String[]{"group"}, new ColumnDataType[]{INT});
+    BlockListMultiStageOperator.Builder input = new BlockListMultiStageOperator.Builder(schema);
+    for (int group = 1; group <= 3; group++) {
+      input.addRow(group);
+      if (group % rowsPerBlock == 0) {
+        input.finishBlock();
+      }
+    }
+    _input = input.buildWithEos();
+    Map<String, String> options = new HashMap<>(spillOptions(trigger, 2));
+    options.put(QueryOptionKey.NUM_GROUPS_LIMIT, "2");
+    options.put(QueryOptionKey.ERROR_ON_NUM_GROUPS_LIMIT, Boolean.toString(errorOnLimit));
+    AggregateOperator operator = getOperator(schema, List.of(), List.of(), List.of(0),
+        PlanNode.NodeHint.EMPTY, options);
+    int rows = 0;
+    MseBlock block = operator.nextBlock();
+    while (block.isData()) {
+      rows += ((MseBlock.Data) block).getNumRows();
+      block = operator.nextBlock();
+    }
+    StatMap<AggregateOperator.StatKey> stats = operator.copyStatMaps();
+    assertTrue(stats.getLong(AggregateOperator.StatKey.SPILL_COUNT) > 0);
+    if (errorOnLimit) {
+      assertTrue(block.isError());
+      assertTrue(((ErrorMseBlock) block).getErrorMessages().containsKey(QueryErrorCode.SERVER_RESOURCE_LIMIT_EXCEEDED));
+    } else {
+      assertTrue(block.isSuccess());
+      assertEquals(rows, 2);
+      assertTrue(stats.getBoolean(AggregateOperator.StatKey.NUM_GROUPS_LIMIT_REACHED));
+    }
+    assertFalse(operator.hasBufferedState());
+    assertEquals(spillDirectoryCount(), 0L);
+  }
+
+  @Test
+  public void testSpillRestoresPartitionBeyondTriggerUpToNumGroupsLimit()
+      throws IOException {
+    DataSchema inputSchema = new DataSchema(new String[]{"group"}, new ColumnDataType[]{INT});
+    _input = new BlockListMultiStageOperator.Builder(inputSchema)
+        .addRow(1)
+        .addRow(2)
+        .addRow(3)
+        .buildWithEos();
+    AggregateOperator operator =
+        getOperator(inputSchema, List.of(), List.of(), List.of(0), PlanNode.NodeHint.EMPTY, spillOptions(2, 1));
+
+    List<Object[]> rows = drainRows(operator);
+
+    assertEquals(rows.size(), 3);
+    assertEquals(spillDirectoryCount(), 0L);
+  }
+
+  @DataProvider(name = "spillCleanupActions")
+  public Object[][] spillCleanupActions() {
+    return new Object[][]{{"close"}, {"cancel"}, {"earlyTerminate"}};
+  }
+
+  @Test
+  public void testEarlyTerminationBeforeInputDoesNotAggregate()
+      throws IOException {
+    AggregateOperator operator = createSpillingSumOperator(false);
+
+    operator.earlyTerminate();
+
+    assertFalse(operator.hasBufferedState());
+    assertTrue(operator.nextBlock().isSuccess());
+    assertEquals(spillDirectoryCount(), 0L);
+  }
+
+  @Test(dataProvider = "spillCleanupActions")
+  public void testSpillCleanupOnTerminalAction(String action)
+      throws IOException {
+    AggregateOperator operator = createSpillingSumOperator(false);
+    assertTrue(operator.nextBlock().isData());
+    assertEquals(spillDirectoryCount(), 1L);
+
+    switch (action) {
+      case "close":
+        operator.close();
+        break;
+      case "cancel":
+        operator.cancel(new RuntimeException("cancelled"));
+        break;
+      case "earlyTerminate":
+        operator.earlyTerminate();
+        break;
+      default:
+        throw new IllegalArgumentException("Unsupported cleanup action: " + action);
+    }
+
+    assertEquals(spillDirectoryCount(), 0L);
+    assertFalse(operator.hasBufferedState(), "Terminal actions should release aggregation buffers");
+  }
+
+  @Test
+  public void testSpillCleanupOnUpstreamError()
+      throws IOException {
+    AggregateOperator operator = createSpillingSumOperator(true);
+
+    MseBlock block = operator.nextBlock();
+
+    assertTrue(block.isError());
+    assertFalse(operator.hasBufferedState(), "Upstream errors should release aggregation buffers immediately");
+    assertEquals(spillDirectoryCount(), 0L);
+  }
+
+  @DataProvider(name = "unsupportedSpillModes")
+  public Object[][] unsupportedSpillModes() {
+    return new Object[][]{{"global", 1}, {"trim", 1}, {"leaf-final", 2}, {"server-disabled", 2}};
+  }
+
+  @Test(dataProvider = "unsupportedSpillModes")
+  public void testSpillDisabledForUnsupportedModes(String mode, int expectedRows)
+      throws IOException {
+    DataSchema inputSchema = new DataSchema(new String[]{"group", "arg"}, new ColumnDataType[]{INT, DOUBLE});
+    _input = new BlockListMultiStageOperator.Builder(inputSchema).addRow(1, 1.0).addRow(2, 2.0).buildWithEos();
+    boolean global = mode.equals("global");
+    DataSchema resultSchema = global
+        ? new DataSchema(new String[]{"sum"}, new ColumnDataType[]{DOUBLE})
+        : new DataSchema(new String[]{"group", "sum"}, new ColumnDataType[]{INT, DOUBLE});
+    Map<String, String> options = new HashMap<>(spillOptions(1, 2));
+    options.put(QueryOptionKey.MSE_AGGREGATION_SPILL_ENABLED, Boolean.toString(!mode.equals("server-disabled")));
+    AggregateNode node = new AggregateNode(-1, resultSchema, PlanNode.NodeHint.EMPTY, List.of(),
+        List.of(getSum(new RexExpression.InputRef(1))), List.of(-1), global ? List.of() : List.of(0), AggType.DIRECT,
+        mode.equals("leaf-final"), null, mode.equals("trim") ? 1 : 0);
+    AggregateOperator operator = new AggregateOperator(OperatorTestUtil.getContext(options), _input, node);
+
+    assertEquals(drainRows(operator).size(), expectedRows);
+    assertEquals(operator.copyStatMaps().getLong(AggregateOperator.StatKey.SPILL_COUNT), 0);
+    assertEquals(spillDirectoryCount(), 0L);
+  }
+
+  @Test(expectedExceptions = IllegalArgumentException.class)
+  public void testSpillPartitionsValidatedWithoutThreshold() {
+    DataSchema schema = new DataSchema(new String[]{"group"}, new ColumnDataType[]{INT});
+    _input = new BlockListMultiStageOperator.Builder(schema).addRow(1).buildWithEos();
+    getOperator(schema, List.of(), List.of(), List.of(0), PlanNode.NodeHint.EMPTY,
+        Map.of(QueryOptionKey.MSE_AGGREGATION_SPILL_PARTITIONS, "999"));
+  }
+
+  @Test
+  public void testDisabledSpillStatsCanBeReadByLegacyNode()
+      throws Exception {
+    DataSchema inputSchema = new DataSchema(new String[]{"group"}, new ColumnDataType[]{INT});
+    _input = new BlockListMultiStageOperator.Builder(inputSchema)
+        .addRow(1)
+        .addRow(2)
+        .buildWithEos();
+    AggregateOperator operator =
+        getOperator(inputSchema, List.of(), List.of(), List.of(0), PlanNode.NodeHint.EMPTY,
+            Map.of(QueryOptionKey.MSE_AGGREGATION_SPILL_ENABLED, "false"));
+    drainRows(operator);
+    StatMap<AggregateOperator.StatKey> statMap =
+        OperatorTestUtil.getStatMap(AggregateOperator.StatKey.class, operator.calculateStats());
+    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+    statMap.serialize(new DataOutputStream(bytes));
+
+    StatMap<LegacyAggregateStatKey> legacyStatMap =
+        StatMap.deserialize(new DataInputStream(new ByteArrayInputStream(bytes.toByteArray())),
+            LegacyAggregateStatKey.class);
+
+    assertEquals(legacyStatMap.getLong(LegacyAggregateStatKey.NUM_GROUPS), 2);
+  }
+
+  @Test
+  public void testSpillRoundTripsAnyValueIntermediateResult() {
+    RexExpression.FunctionCall anyValue =
+        new RexExpression.FunctionCall(INT, SqlKind.ANY_VALUE.name(), List.of(new RexExpression.InputRef(1)));
+    DataSchema intermediateSchema =
+        new DataSchema(new String[]{"group", "anyValue"}, new ColumnDataType[]{INT, INT});
+    _input = new BlockListMultiStageOperator.Builder(intermediateSchema)
+        .addRow(1, 10)
+        .finishBlock()
+        .addRow(1, 20)
+        .buildWithEos();
+    AggregateOperator operator =
+        getOperator(intermediateSchema, List.of(anyValue), List.of(-1), List.of(0), AggType.INTERMEDIATE,
+            spillOptions(1, 2));
+
+    List<Object[]> rows = drainRows(operator);
+    assertEquals(rows.size(), 1);
+    assertEquals(rows.get(0), new Object[]{1, 10});
+  }
+
+  @DataProvider(name = "binaryAnyValueModes")
+  public Object[][] binaryAnyValueModes() {
+    return new Object[][]{
+        {BYTES, AggType.DIRECT},
+        {BYTES, AggType.INTERMEDIATE},
+        {UUID, AggType.DIRECT},
+        {UUID, AggType.INTERMEDIATE}
+    };
+  }
+
+  @Test(dataProvider = "binaryAnyValueModes")
+  public void testSpillRoundTripsBinaryAnyValue(ColumnDataType dataType, AggType aggType) {
+    RexExpression.FunctionCall anyValue =
+        new RexExpression.FunctionCall(dataType, SqlKind.ANY_VALUE.name(), List.of(new RexExpression.InputRef(1)));
+    DataSchema schema = new DataSchema(new String[]{"group", "anyValue"}, new ColumnDataType[]{INT, dataType});
+    ByteArray firstValue = new ByteArray(new byte[16]);
+    ByteArray secondValue = new ByteArray(new byte[]{
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1
+    });
+    _input = new BlockListMultiStageOperator.Builder(schema)
+        .addRow(1, firstValue)
+        .finishBlock()
+        .addRow(1, secondValue)
+        .buildWithEos();
+    AggregateOperator operator =
+        getOperator(schema, List.of(anyValue), List.of(-1), List.of(0), aggType, spillOptions(1, 2));
+
+    List<Object[]> rows = drainRows(operator);
+    assertEquals(rows.size(), 1);
+    assertEquals(rows.get(0), new Object[]{1, firstValue});
   }
 
   @Test
@@ -397,16 +787,104 @@ public class AggregateOperatorTest {
     return new RexExpression.FunctionCall(ColumnDataType.INT, SqlKind.SUM.name(), List.of(arg));
   }
 
+  private static List<MseBlock.Data> drainDataBlocks(AggregateOperator operator) {
+    List<MseBlock.Data> blocks = new ArrayList<>();
+    MseBlock block = operator.nextBlock();
+    while (block.isData()) {
+      blocks.add((MseBlock.Data) block);
+      block = operator.nextBlock();
+    }
+    assertTrue(block.isSuccess());
+    return blocks;
+  }
+
+  private static List<Object[]> drainRows(AggregateOperator operator) {
+    List<Object[]> rows = new ArrayList<>();
+    for (MseBlock.Data block : drainDataBlocks(operator)) {
+      rows.addAll(block.asRowHeap().getRows());
+    }
+    return rows;
+  }
+
+  private AggregateOperator createSpillingSumOperator(boolean error) {
+    DataSchema inputSchema = new DataSchema(new String[]{"group", "arg"}, new ColumnDataType[]{INT, DOUBLE});
+    BlockListMultiStageOperator.Builder inputBuilder = new BlockListMultiStageOperator.Builder(inputSchema)
+        .addRow(1, 1.0)
+        .finishBlock()
+        .addRow(2, 2.0);
+    _input = error
+        ? inputBuilder.buildWithError(ErrorMseBlock.fromException(new RuntimeException("upstream failure")))
+        : inputBuilder.buildWithEos();
+    DataSchema resultSchema = new DataSchema(new String[]{"group", "sum"}, new ColumnDataType[]{INT, DOUBLE});
+    return getOperator(resultSchema, List.of(getSum(new RexExpression.InputRef(1))), List.of(-1), List.of(0),
+        PlanNode.NodeHint.EMPTY, spillOptions(1, 2));
+  }
+
+  private long spillDirectoryCount()
+      throws IOException {
+    try (var entries = Files.list(_spillRoot)) {
+      return entries.count();
+    }
+  }
+
+  private Map<String, String> spillOptions(int threshold, int partitions) {
+    return Map.of(QueryOptionKey.MSE_AGGREGATION_SPILL_ENABLED, "true",
+        QueryOptionKey.MSE_AGGREGATION_SPILL_MAX_GROUPS, Integer.toString(threshold),
+        QueryOptionKey.MSE_AGGREGATION_SPILL_PARTITIONS, Integer.toString(partitions),
+        QueryOptionKey.MSE_AGGREGATION_SPILL_DIR, _spillRoot.toString(),
+        QueryOptionKey.MSE_AGGREGATION_SPILL_MAX_DISK_BYTES, "1073741824",
+        QueryOptionKey.MSE_AGGREGATION_SPILL_SERVER_MAX_DISK_BYTES, "8589934592");
+  }
+
   private AggregateOperator getOperator(DataSchema resultSchema, List<RexExpression.FunctionCall> aggCalls,
       List<Integer> filterArgs, List<Integer> groupKeys, PlanNode.NodeHint nodeHint,
       Map<String, String> opChainMetadata) {
+    return getOperator(resultSchema, aggCalls, filterArgs, groupKeys, AggType.DIRECT, nodeHint, opChainMetadata);
+  }
+
+  private AggregateOperator getOperator(DataSchema resultSchema, List<RexExpression.FunctionCall> aggCalls,
+      List<Integer> filterArgs, List<Integer> groupKeys, AggType aggType, Map<String, String> opChainMetadata) {
+    return getOperator(resultSchema, aggCalls, filterArgs, groupKeys, aggType, PlanNode.NodeHint.EMPTY,
+        opChainMetadata);
+  }
+
+  private AggregateOperator getOperator(DataSchema resultSchema, List<RexExpression.FunctionCall> aggCalls,
+      List<Integer> filterArgs, List<Integer> groupKeys, AggType aggType, PlanNode.NodeHint nodeHint,
+      Map<String, String> opChainMetadata) {
     return new AggregateOperator(OperatorTestUtil.getContext(opChainMetadata), _input,
-        new AggregateNode(-1, resultSchema, nodeHint, List.of(), aggCalls, filterArgs, groupKeys, AggType.DIRECT,
-            false, null, 0));
+        new AggregateNode(-1, resultSchema, nodeHint, List.of(), aggCalls, filterArgs, groupKeys, aggType, false, null,
+            0));
   }
 
   private AggregateOperator getOperator(DataSchema resultSchema, List<RexExpression.FunctionCall> aggCalls,
       List<Integer> filterArgs, List<Integer> groupKeys) {
     return getOperator(resultSchema, aggCalls, filterArgs, groupKeys, PlanNode.NodeHint.EMPTY, Map.of());
+  }
+
+  private enum LegacyAggregateStatKey implements StatMap.Key {
+    EXECUTION_TIME_MS(StatMap.Type.LONG),
+    EMITTED_ROWS(StatMap.Type.LONG),
+    GROUPS_TRIMMED(StatMap.Type.BOOLEAN),
+    NUM_GROUPS_LIMIT_REACHED(StatMap.Type.BOOLEAN),
+    NUM_GROUPS_WARNING_LIMIT_REACHED(StatMap.Type.BOOLEAN),
+    NUM_GROUPS(StatMap.Type.LONG) {
+      @Override
+      public long merge(long value1, long value2) {
+        return Math.max(value1, value2);
+      }
+    },
+    ALLOCATED_MEMORY_BYTES(StatMap.Type.LONG),
+    GC_TIME_MS(StatMap.Type.LONG);
+
+    private final StatMap.Type _type;
+
+    LegacyAggregateStatKey(StatMap.Type type) {
+      _type = type;
+    }
+
+    @Override
+    public StatMap.Type getType() {
+      return _type;
+    }
   }
 }
