@@ -44,7 +44,7 @@ public class DispatchableSubPlan {
   private final PairList<Integer, String> _queryResultFields;
 
   /// Map from stage id to stage plan.
-  private final Map<Integer, DispatchablePlanFragment> _queryStageMap;
+  private Map<Integer, DispatchablePlanFragment> _queryStageMap;
   private final Set<String> _tableNames;
   private final Map<String, Set<String>> _tableToUnavailableSegmentsMap;
   private final long _numSegmentsPrunedByBroker;
@@ -73,6 +73,18 @@ public class DispatchableSubPlan {
   /// @return stage plan map.
   public Map<Integer, DispatchablePlanFragment> getQueryStageMap() {
     return Collections.unmodifiableMap(_queryStageMap);
+  }
+
+  /// Returns a replacement physical plan with the same logical-query metadata and a new stage graph.
+  public DispatchableSubPlan withStageMap(Map<Integer, DispatchablePlanFragment> stages) {
+    return new DispatchableSubPlan(_queryResultFields, Map.copyOf(stages), _tableNames,
+        _tableToUnavailableSegmentsMap, _numSegmentsPrunedByBroker, _allLeafStagesEmpty);
+  }
+
+  /// Publishes a broker-thread-owned adaptive rewrite after its completed-stage and output contracts are validated.
+  /// Keeping this container lets response statistics and explain consumers observe the plan that actually executed.
+  public void replaceStageMap(Map<Integer, DispatchablePlanFragment> stages) {
+    _queryStageMap = Map.copyOf(stages);
   }
 
   private static Comparator<DispatchablePlanFragment> byStageIdComparator() {

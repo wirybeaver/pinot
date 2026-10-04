@@ -69,7 +69,6 @@ import org.apache.pinot.query.mailbox.MailboxService;
 import org.apache.pinot.query.planner.PlanFragment;
 import org.apache.pinot.query.planner.physical.DispatchablePlanFragment;
 import org.apache.pinot.query.planner.physical.DispatchableSubPlan;
-import org.apache.pinot.query.planner.plannode.MailboxReceiveNode;
 import org.apache.pinot.query.planner.plannode.MailboxSendNode;
 import org.apache.pinot.query.planner.plannode.PlanNode;
 import org.apache.pinot.query.planner.serde.PlanNodeDeserializer;
@@ -138,6 +137,7 @@ public class QueryDispatcher implements PinotClusterConfigChangeListener {
   /// Cluster-level default for stream-stats mode. Used as the fallback in [#submitAndReduce] when the query
   /// does not carry an explicit [QueryOptionKey#STREAM_STATS] override.
   private final boolean _streamStatsDefault;
+  private final List<AdaptiveQueryRule> _adaptiveRules;
   /// Whether leaf-stage segment lists are shipped as native protobuf fields of the worker metadata instead of the
   /// legacy JSON custom property. Seeded from the static broker config and then followed live from cluster config on
   /// [#ENABLE_PROTO_SEGMENT_LIST_KEY], so an operator can turn it on once every server of the cluster has been
@@ -150,6 +150,15 @@ public class QueryDispatcher implements PinotClusterConfigChangeListener {
     this(mailboxService, failureDetector, tlsConfig, enableCancellation, cancelTimeout,
         GrpcKeepAliveConfig.DISABLED, false, CommonConstants.Broker.DEFAULT_STREAM_STATS_DRAIN_MS,
         CommonConstants.Broker.DEFAULT_MSE_ENABLE_PROTO_SEGMENT_LIST);
+  }
+
+  /// Constructs a dispatcher with an explicitly ordered adaptive-rule pipeline. Rules may invoke physical replanners;
+  /// their output becomes the next dispatch plan only after completed-stage validation. Queries snapshot the list.
+  public QueryDispatcher(MailboxService mailboxService, FailureDetector failureDetector, @Nullable TlsConfig tlsConfig,
+      boolean enableCancellation, Duration cancelTimeout, List<AdaptiveQueryRule> adaptiveRules) {
+    this(mailboxService, failureDetector, tlsConfig, enableCancellation, cancelTimeout,
+        GrpcKeepAliveConfig.DISABLED, false, CommonConstants.Broker.DEFAULT_STREAM_STATS_DRAIN_MS,
+        CommonConstants.Broker.DEFAULT_MSE_ENABLE_PROTO_SEGMENT_LIST, adaptiveRules);
   }
 
   /// Overload that accepts gRPC keep-alive settings for broker dispatch channels. A non-positive `keepAliveTimeMs`
@@ -175,6 +184,15 @@ public class QueryDispatcher implements PinotClusterConfigChangeListener {
   private QueryDispatcher(MailboxService mailboxService, FailureDetector failureDetector, @Nullable TlsConfig tlsConfig,
       boolean enableCancellation, Duration cancelTimeout, GrpcKeepAliveConfig keepAliveConfig,
       boolean streamStatsDefault, long statsDrainMs, boolean enableProtoSegmentList) {
+    this(mailboxService, failureDetector, tlsConfig, enableCancellation, cancelTimeout, keepAliveConfig,
+        streamStatsDefault, statsDrainMs, enableProtoSegmentList, List.of(new CoalescePartitionsRule()));
+  }
+
+  private QueryDispatcher(MailboxService mailboxService, FailureDetector failureDetector, @Nullable TlsConfig tlsConfig,
+      boolean enableCancellation, Duration cancelTimeout, GrpcKeepAliveConfig keepAliveConfig,
+      boolean streamStatsDefault, long statsDrainMs, boolean enableProtoSegmentList,
+      List<AdaptiveQueryRule> adaptiveRules) {
+    _adaptiveRules = List.copyOf(adaptiveRules);
     _cancelTimeout = cancelTimeout;
     _statsDrainMs = statsDrainMs;
     _mailboxService = mailboxService;
@@ -281,29 +299,28 @@ public class QueryDispatcher implements PinotClusterConfigChangeListener {
     Deadline deadline = Deadline.after(timeoutMs, TimeUnit.MILLISECONDS);
     Set<QueryServerInstance> servers = new HashSet<>();
     Set<QueryServerInstance> incrementedServers = new HashSet<>();
-    Set<DispatchablePlanFragment> stagePlansWithoutRoot = dispatchableSubPlan.getQueryStagesWithoutRoot();
-    Map<Integer, Set<Integer>> expectedWorkersByStage = expectedWorkersByStage(stagePlansWithoutRoot);
+    boolean adaptive = QueryOptionsUtils.isAdaptiveExecution(queryOptions);
+    AdaptiveQueryExecution execution = new AdaptiveQueryExecution(requestId, dispatchableSubPlan,
+        adaptive ? _adaptiveRules : List.of(), queryOptions);
     Map<Integer, Integer> expectedByStage = new HashMap<>();
-    int totalExpected = 0;
-    for (Map.Entry<Integer, Set<Integer>> entry : expectedWorkersByStage.entrySet()) {
-      int expected = entry.getValue().size();
-      expectedByStage.put(entry.getKey(), expected);
-      totalExpected += expected;
-    }
-    StreamingQuerySession session =
-        new StreamingQuerySession(requestId, totalExpected, expectedWorkersByStage);
-    List<Set<Integer>> dispatchGroups = StageDispatchGraph.create(dispatchableSubPlan);
+    StreamingQuerySession session = new StreamingQuerySession(requestId, 0, Map.of());
+    boolean successful = false;
     QueryResult brokerResult = null;
 
     try {
-      for (Set<Integer> group : dispatchGroups) {
+      while (!execution.nextGroup().isEmpty()) {
+        if (deadline.isExpired()) {
+          throw new TimeoutException("Query deadline elapsed during adaptive planning");
+        }
+        Set<Integer> group = execution.nextGroup();
+        Set<DispatchablePlanFragment> stagePlansWithoutRoot = dispatchableSubPlan.getQueryStagesWithoutRoot();
+        expectedByStage.clear();
+        expectedWorkersByStage(stagePlansWithoutRoot).forEach((id, workers) -> expectedByStage.put(id, workers.size()));
+        execution.bindInputs(group);
         Set<Integer> remoteStageIds = new HashSet<>(group);
         remoteStageIds.remove(0);
-        Set<DispatchablePlanFragment> readyStagePlans =
-            selectStagePlans(stagePlansWithoutRoot, remoteStageIds);
-        if (QueryOptionsUtils.isMaterializedExchange(queryOptions)) {
-          bindMaterializedInputs(requestId, readyStagePlans, dispatchableSubPlan, session.getMaterializedOutputs());
-        }
+        Set<DispatchablePlanFragment> readyStagePlans = selectStagePlans(stagePlansWithoutRoot, remoteStageIds);
+        session.registerStages(expectedWorkersByStage(readyStagePlans));
         submitWithStream(requestId, readyStagePlans, deadline, servers, queryOptions, session);
 
         if (statsManager != null) {
@@ -318,7 +335,6 @@ public class QueryDispatcher implements PinotClusterConfigChangeListener {
           brokerResult = runReducer(dispatchableSubPlan, queryOptions, _mailboxService);
           if (brokerResult.getProcessingException() != null) {
             session.fanOutCancel();
-            cancel(requestId, servers);
             long statsWaitMs = Math.min(_statsDrainMs, remainingTimeMs(deadline));
             session.awaitCompletion(statsWaitMs, TimeUnit.MILLISECONDS);
             return mergeSessionStatsIntoResult(brokerResult, session, expectedByStage);
@@ -329,23 +345,25 @@ public class QueryDispatcher implements PinotClusterConfigChangeListener {
           session.awaitSuccessfulStages(remoteStageIds, remainingTimeMs(deadline), TimeUnit.MILLISECONDS);
           session.awaitStreamsClosed(remainingTimeMs(deadline), TimeUnit.MILLISECONDS);
         }
+        execution.complete(group, session);
       }
 
       if (brokerResult == null) {
         throw new IllegalStateException("Stage dispatch graph completed without executing root stage 0");
       }
-      // Every materialized input was already validated before its consumer was dispatched.
-      return mergeSessionStatsIntoResult(brokerResult, session, expectedByStage);
+      QueryResult result = mergeSessionStatsIntoResult(brokerResult, session, expectedByStage);
+      successful = true;
+      return result;
     } catch (Exception ex) {
-      // Completed producer streams are no longer available for in-stream cancellation. Include their servers so
-      // unconsumed materialized output is cleaned even when a later group fails before opening its streams.
-      cancel(requestId, servers);
       return tryRecoverWithStream(session, expectedByStage, deadlineMs, ex);
     } catch (Throwable e) {
       session.fanOutCancel();
-      cancel(requestId, servers);
       throw e;
     } finally {
+      if (!successful || adaptive) {
+        // Replanning can prune consumers entirely. Release completed output even on adaptive query success.
+        cancel(requestId, servers);
+      }
       if (statsManager != null) {
         for (QueryServerInstance server : incrementedServers) {
           statsManager.recordStatsUponResponseArrival(requestId, server.getInstanceId(), -1);
@@ -383,35 +401,6 @@ public class QueryDispatcher implements PinotClusterConfigChangeListener {
       }
     }
     return selected;
-  }
-
-  private static void bindMaterializedInputs(long requestId, Set<DispatchablePlanFragment> consumerStages,
-      DispatchableSubPlan subPlan, List<Worker.MaterializedPartitionHandle> materializedOutputs) {
-    Map<Integer, DispatchablePlanFragment> stages = subPlan.getQueryStageMap();
-    for (DispatchablePlanFragment consumerStage : consumerStages) {
-      Set<Integer> producerStageIds = new HashSet<>();
-      collectMaterializedProducerStageIds(consumerStage.getPlanFragment().getFragmentRoot(), producerStageIds);
-      if (producerStageIds.isEmpty()) {
-        continue;
-      }
-      if (producerStageIds.size() != 1) {
-        throw new IllegalStateException("Multiple materialized inputs for consumer stage "
-            + consumerStage.getPlanFragment().getFragmentId() + " are not supported");
-      }
-      int producerStageId = producerStageIds.iterator().next();
-      DispatchablePlanFragment producerStage = stages.get(producerStageId);
-      consumerStage.setWorkerMetadataList(MaterializedPartitionRouter.route(requestId, producerStageId,
-          producerStage.getWorkerMetadataList(), consumerStage.getWorkerMetadataList(), materializedOutputs));
-    }
-  }
-
-  private static void collectMaterializedProducerStageIds(PlanNode node, Set<Integer> producerStageIds) {
-    if (node instanceof MailboxReceiveNode && ((MailboxReceiveNode) node).isMaterialized()) {
-      producerStageIds.add(((MailboxReceiveNode) node).getSenderStageId());
-    }
-    for (PlanNode input : node.getInputs()) {
-      collectMaterializedProducerStageIds(input, producerStageIds);
-    }
   }
 
   /// Streaming variant of [#submitAndReduce]: opens one `SubmitWithStream` bidi RPC per server, runs the

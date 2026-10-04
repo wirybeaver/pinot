@@ -20,6 +20,7 @@ package org.apache.pinot.query.runtime.queries;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import java.nio.file.Files;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -27,17 +28,26 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 import org.apache.pinot.common.failuredetector.FailureDetector;
+import org.apache.pinot.common.proto.Worker;
 import org.apache.pinot.common.response.broker.ResultTable;
 import org.apache.pinot.query.QueryEnvironmentTestBase;
 import org.apache.pinot.query.QueryServerEnclosure;
 import org.apache.pinot.query.mailbox.MailboxService;
+import org.apache.pinot.query.mailbox.materialized.MaterializedMailboxStore;
 import org.apache.pinot.query.planner.physical.DispatchablePlanFragment;
 import org.apache.pinot.query.planner.physical.DispatchableSubPlan;
+import org.apache.pinot.query.planner.plannode.PlanNode;
+import org.apache.pinot.query.planner.plannode.ValueNode;
 import org.apache.pinot.query.routing.QueryServerInstance;
+import org.apache.pinot.query.routing.WorkerMetadata;
 import org.apache.pinot.query.runtime.MultiStageStatsTreeBuilder;
+import org.apache.pinot.query.service.dispatch.AdaptiveQueryRule;
 import org.apache.pinot.query.service.dispatch.QueryDispatcher;
 import org.apache.pinot.query.service.server.QueryServer;
 import org.apache.pinot.query.testutils.MockInstanceDataManagerFactory;
@@ -59,6 +69,7 @@ import org.apache.pinot.spi.utils.builder.TableNameBuilder;
 import org.apache.pinot.sql.parsers.CalciteSqlParser;
 import org.apache.pinot.sql.parsers.SqlNodeAndOptions;
 import org.apache.pinot.sql.parsers.rewriter.RlsUtils;
+import org.apache.pinot.util.TestUtils;
 import org.assertj.core.api.Assertions;
 import org.intellij.lang.annotations.Language;
 import org.testng.Assert;
@@ -78,6 +89,7 @@ import static org.testng.Assert.assertTrue;
 public class QueryRunnerTest extends QueryRunnerTestBase {
   private final List<QueryServer> _dispatchRpcServers = new ArrayList<>();
   private final Map<QueryServerInstance, QueryServerInstance> _dispatchInstances = new HashMap<>();
+  private final List<QueryDispatcher> _dispatchers = new ArrayList<>();
   private QueryDispatcher _dispatcher;
 
   @DataProvider
@@ -94,26 +106,9 @@ public class QueryRunnerTest extends QueryRunnerTestBase {
     QueryDispatcher.QueryResult baseline = queryRunner(sql, false);
     long requestId = REQUEST_ID_GEN.getAndIncrement();
     String materializedSql = "SET materializedExchange=true; SET stagedDispatch=true; " + sql;
-    SqlNodeAndOptions parsed = CalciteSqlParser.compileToSqlNodeAndOptions(materializedSql);
-    DispatchableSubPlan plan;
-    try (var compiled = _queryEnvironment.compile(materializedSql, parsed)) {
-      plan = compiled.planQuery(requestId).getQueryPlan();
-    }
-    for (DispatchablePlanFragment stage : plan.getQueryStagesWithoutRoot()) {
-      Map<QueryServerInstance, List<Integer>> workers = new HashMap<>();
-      stage.getServerInstanceToWorkerIdMap().forEach((server, ids) -> workers.put(_dispatchInstances.get(server), ids));
-      stage.setServerInstanceToWorkerIdMap(workers);
-    }
-    long now = System.currentTimeMillis();
-    QueryExecutionContext execution = new QueryExecutionContext(QueryExecutionContext.QueryType.MSE,
-        requestId, Long.toString(requestId), null, now, now + 10_000, now + 20_000, "broker", "broker", "");
-    DefaultRequestContext request = new DefaultRequestContext();
-    request.setRequestId(requestId);
-    QueryDispatcher.QueryResult result;
-    try (QueryThreadContext ignored = QueryThreadContext.open(execution, new QueryThreadContext.MseWorkerInfo(0, 0),
-        ThreadAccountantUtils.getNoOpAccountant())) {
-      result = _dispatcher.submitAndReduce(request, plan, 10_000, parsed.getOptions());
-    }
+    DispatchableSubPlan plan = compileDispatchPlan(materializedSql, requestId);
+    QueryDispatcher.QueryResult result = runDispatchedQuery(_dispatcher, requestId, plan,
+        CalciteSqlParser.compileToSqlNodeAndOptions(materializedSql).getOptions());
     assertNull(baseline.getProcessingException());
     assertNull(result.getProcessingException(), "Materialized query failed: " + result.getProcessingException());
     assertTrue(plan.getQueryStagesWithoutRoot().stream()
@@ -121,6 +116,132 @@ public class QueryRunnerTest extends QueryRunnerTestBase {
         .anyMatch(worker -> !worker.getMaterializedInputs().isEmpty()), "Expected late-bound materialized inputs");
     assertEquals(result.getResultTable().getDataSchema(), baseline.getResultTable().getDataSchema());
     compareRowEquals(result.getResultTable(), baseline.getResultTable().getRows(), true);
+  }
+
+  @DataProvider
+  public Object[][] coalescingQueries() {
+    return new Object[][]{
+        {"SELECT col1, COUNT(*) FROM a GROUP BY col1"},
+        {"SELECT col1, COUNT(*) FROM a WHERE col1 = 'dave' GROUP BY col1"}
+    };
+  }
+
+  @Test(dataProvider = "coalescingQueries")
+  public void testAdaptiveCoalescingExecutesAllOriginalPartitions(String sql)
+      throws Exception {
+    QueryDispatcher.QueryResult baseline = queryRunner(sql, false);
+    long requestId = REQUEST_ID_GEN.getAndIncrement();
+    String adaptiveSql = "SET adaptiveExecution=true; SET stageParallelism=4; SET numGroupsLimit=100000; " + sql;
+    DispatchableSubPlan plan = compileDispatchPlan(adaptiveSql, requestId);
+    Map<Integer, Integer> originalWorkers = plan.getQueryStageMap().entrySet().stream()
+        .collect(Collectors.toMap(Map.Entry::getKey, entry -> entry.getValue().getWorkerMetadataList().size()));
+
+    QueryDispatcher.QueryResult result = runDispatchedQuery(_dispatcher, requestId, plan,
+        CalciteSqlParser.compileToSqlNodeAndOptions(adaptiveSql).getOptions());
+
+    assertNull(result.getProcessingException(), String.valueOf(result.getProcessingException()));
+    assertEquals(result.getResultTable().getDataSchema(), baseline.getResultTable().getDataSchema());
+    compareRowEquals(result.getResultTable(), baseline.getResultTable().getRows());
+    List<DispatchablePlanFragment> coalesced = plan.getQueryStagesWithoutRoot().stream()
+        .filter(stage ->
+            stage.getWorkerMetadataList().size() < originalWorkers.get(stage.getPlanFragment().getFragmentId()))
+        .toList();
+    assertEquals(coalesced.size(), 1, "The production dispatcher must execute the coalescing rule");
+    DispatchablePlanFragment consumer = coalesced.get(0);
+    assertEquals(consumer.getWorkerMetadataList().size(), 1);
+    List<Worker.MaterializedPartitionHandle> handles = consumer.getWorkerMetadataList().get(0).getMaterializedInputs();
+    int producer = handles.get(0).getProducerStageId();
+    int originalPartitions = originalWorkers.get(consumer.getPlanFragment().getFragmentId());
+    assertEquals(handles.size(), originalWorkers.get(producer) * originalPartitions);
+    assertEquals(handles.stream().map(Worker.MaterializedPartitionHandle::getLogicalPartitionId).distinct().count(),
+        (long) originalPartitions);
+    for (DispatchablePlanFragment stage : plan.getQueryStagesWithoutRoot()) {
+      QueryDispatcher.QueryResult.StageCoverage coverage = result.getStageCoverage().get(stage.getPlanFragment()
+          .getFragmentId());
+      assertEquals(coverage.getResponded(), stage.getWorkerMetadataList().size());
+      assertEquals(coverage.getMissing(), 0);
+      assertEquals(coverage.getMergeFailed(), 0);
+    }
+  }
+
+  @Test
+  public void testRuleReplansEmptyInputIntoBrokerValues()
+      throws Exception {
+    String sql = "SELECT col1, COUNT(*) FROM a WHERE col1 = 'dave' GROUP BY col1 ORDER BY col1";
+    QueryDispatcher.QueryResult baseline = queryRunner(sql, false);
+    long requestId = REQUEST_ID_GEN.getAndIncrement();
+    String adaptiveSql = "SET adaptiveExecution=true; " + sql;
+    DispatchableSubPlan plan = compileDispatchPlan(adaptiveSql, requestId);
+    AtomicInteger replans = new AtomicInteger();
+    AdaptiveQueryRule emptyInputRule = (current, context) -> {
+      assertTrue(context.materializedOutputs().values().stream().flatMap(output -> output.partitions().stream())
+          .flatMap(List::stream).allMatch(handle -> handle.getRowCount() == 0));
+      assertTrue(context.statistics().getRespondedByStage().values().stream().mapToInt(Integer::intValue).sum() > 0);
+      replans.incrementAndGet();
+      return replanEmptyResult(current, context.completedStages());
+    };
+    QueryDispatcher dispatcher = new QueryDispatcher(_mailboxService, mock(FailureDetector.class), null, true,
+        Duration.ofSeconds(1), List.of(emptyInputRule));
+    _dispatchers.add(dispatcher);
+
+    QueryDispatcher.QueryResult result = runDispatchedQuery(dispatcher, requestId, plan,
+        CalciteSqlParser.compileToSqlNodeAndOptions(adaptiveSql).getOptions());
+
+    assertNull(result.getProcessingException(), String.valueOf(result.getProcessingException()));
+    assertEquals(replans.get(), 1);
+    assertTrue(plan.getQueryStageMap().get(0).getPlanFragment().getFragmentRoot() instanceof ValueNode);
+    assertEquals(result.getResultTable().getDataSchema(), baseline.getResultTable().getDataSchema());
+    compareRowEquals(result.getResultTable(), baseline.getResultTable().getRows(), true);
+    // Only completed producers remain; the original aggregate consumer was removed and never dispatched.
+    assertEquals(plan.getQueryStagesWithoutRoot().size(), 1);
+    assertEquals(result.getStageStatsTrees().keySet(), plan.getQueryStagesWithoutRoot().stream()
+        .map(stage -> stage.getPlanFragment().getFragmentId()).collect(Collectors.toSet()));
+    for (QueryServerInstance server : _dispatchInstances.values()) {
+      TestUtils.waitForCondition(ignored -> !Files.exists(MaterializedMailboxStore.defaultRoot(server.getHostname(),
+          server.getQueryMailboxPort()).resolve(Long.toString(requestId))), 5_000,
+          "AQE must release materialized files when replanning removes their consumers");
+    }
+  }
+
+  private static DispatchableSubPlan replanEmptyResult(DispatchableSubPlan plan, Set<Integer> completedStages) {
+    Map<Integer, DispatchablePlanFragment> stages = new HashMap<>();
+    completedStages.forEach(id -> stages.put(id, plan.getQueryStageMap().get(id)));
+    DispatchablePlanFragment broker = plan.getQueryStageMap().get(0);
+    PlanNode values = new ValueNode(0, broker.getPlanFragment().getFragmentRoot().getDataSchema(),
+        PlanNode.NodeHint.EMPTY, List.of(), List.of());
+    DispatchablePlanFragment replacement = DispatchablePlanFragment.copyWithRoot(broker, values);
+    replacement.setWorkerMetadataList(List.of(new WorkerMetadata(0, Map.of())));
+    stages.put(0, replacement);
+    return plan.withStageMap(stages);
+  }
+
+  private DispatchableSubPlan compileDispatchPlan(String sql, long requestId)
+      throws Exception {
+    SqlNodeAndOptions parsed = CalciteSqlParser.compileToSqlNodeAndOptions(sql);
+    DispatchableSubPlan plan;
+    try (var compiled = _queryEnvironment.compile(sql, parsed)) {
+      plan = compiled.planQuery(requestId).getQueryPlan();
+    }
+    for (DispatchablePlanFragment stage : plan.getQueryStagesWithoutRoot()) {
+      Map<QueryServerInstance, List<Integer>> workers = new HashMap<>();
+      stage.getServerInstanceToWorkerIdMap().forEach((server, ids) -> workers.put(_dispatchInstances.get(server), ids));
+      stage.setServerInstanceToWorkerIdMap(workers);
+    }
+    return plan;
+  }
+
+  private QueryDispatcher.QueryResult runDispatchedQuery(QueryDispatcher dispatcher, long requestId,
+      DispatchableSubPlan plan, Map<String, String> options)
+      throws Exception {
+    long now = System.currentTimeMillis();
+    QueryExecutionContext execution = new QueryExecutionContext(QueryExecutionContext.QueryType.MSE,
+        requestId, Long.toString(requestId), null, now, now + 10_000, now + 20_000, "broker", "broker", "");
+    DefaultRequestContext request = new DefaultRequestContext();
+    request.setRequestId(requestId);
+    try (QueryThreadContext ignored = QueryThreadContext.open(execution, new QueryThreadContext.MseWorkerInfo(0, 0),
+        ThreadAccountantUtils.getNoOpAccountant())) {
+      return dispatcher.submitAndReduce(request, plan, 10_000, options);
+    }
   }
 
   //@formatter:off
@@ -221,6 +342,7 @@ public class QueryRunnerTest extends QueryRunnerTestBase {
         factory1.getRegisteredSchemaMap(), factory1.buildTableSegmentNameMap(), factory2.buildTableSegmentNameMap(),
         null);
     _dispatcher = new QueryDispatcher(_mailboxService, mock(FailureDetector.class), null, true, Duration.ofSeconds(1));
+    _dispatchers.add(_dispatcher);
   }
 
   private void startQueryServer(QueryServerEnclosure enclosure) {
@@ -239,7 +361,7 @@ public class QueryRunnerTest extends QueryRunnerTestBase {
   @AfterClass
   public void tearDown() {
     _dispatchRpcServers.forEach(QueryServer::shutdown);
-    _dispatcher.shutdown();
+    _dispatchers.forEach(QueryDispatcher::shutdown);
   }
 
   /// The self stats of a node are the node's own value minus its children's. A mailbox send reports its stats from

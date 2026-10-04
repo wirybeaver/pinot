@@ -55,6 +55,21 @@ public class QueryOptionsUtilsTest {
       List.of(TIMEOUT_MS, MAX_SERVER_RESPONSE_SIZE_BYTES, MAX_QUERY_RESPONSE_SIZE_BYTES);
 
   @Test
+  public void adaptiveExecutionEnablesPrerequisitesButCoalescingCanBeDisabled() {
+    assertFalse(QueryOptionsUtils.isAdaptiveExecution(Map.of()));
+    assertFalse(QueryOptionsUtils.isMaterializedExchange(Map.of()));
+    assertFalse(QueryOptionsUtils.isStagedDispatch(Map.of()));
+    assertEquals(QueryOptionsUtils.getAqeTargetPartitionBytes(Map.of()), 64L * 1024 * 1024);
+    Map<String, String> options = Map.of(ADAPTIVE_EXECUTION, "true", AQE_TARGET_PARTITION_BYTES, "0");
+    assertTrue(QueryOptionsUtils.isAdaptiveExecution(options));
+    assertTrue(QueryOptionsUtils.isMaterializedExchange(options));
+    assertTrue(QueryOptionsUtils.isStagedDispatch(options));
+    assertEquals(QueryOptionsUtils.getAqeTargetPartitionBytes(options), 0L);
+    expectThrows(IllegalArgumentException.class,
+        () -> QueryOptionsUtils.getAqeTargetPartitionBytes(Map.of(AQE_TARGET_PARTITION_BYTES, "-1")));
+  }
+
+  @Test
   public void shouldConvertCaseInsensitiveMapToUseCorrectValues() {
     // Given:
     Map<String, String> configs = Map.of("ENABLENullHandling", "true", "useMULTISTAGEEngine", "false");

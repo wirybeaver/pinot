@@ -50,6 +50,33 @@ import static org.testng.Assert.assertTrue;
 public class StreamingQuerySessionTest {
 
   @Test
+  public void testRuntimeSnapshotAllowsLargerReplannedGroup()
+      throws Exception {
+    StreamingQuerySession session = new StreamingQuerySession(1L, 0, Map.of());
+    session.registerStages(Map.of(2, Set.of(0)));
+    StreamingServerHandle stream = requestId -> { };
+    session.registerStream(stream);
+    session.recordOpChainComplete(buildOpChainComplete(2, 0, 1, 11));
+    session.awaitSuccessfulStages(Set.of(2), 0, TimeUnit.NANOSECONDS);
+    // Successful reports are insufficient until the group's transport has also completed.
+    assertThrows(IllegalStateException.class, () -> session.registerStages(Map.of(1, Set.of(0, 1, 2))));
+    session.unregisterStream(stream);
+
+    StreamingQuerySession.Coverage snapshot = session.snapshotRuntimeStats();
+    session.registerStages(Map.of(1, Set.of(0, 1, 2)));
+    assertEquals(session.getExpectedOpChains(), 4);
+    assertEquals(session.getOutstandingCount(), 3L);
+    for (int workerId = 0; workerId < 3; workerId++) {
+      session.recordOpChainComplete(buildOpChainComplete(1, workerId, 1, 5));
+    }
+    session.awaitSuccessfulStages(Set.of(1), 0, TimeUnit.NANOSECONDS);
+    assertTrue(session.awaitCompletion(0, TimeUnit.NANOSECONDS));
+    assertEquals(snapshot.getRespondedByStage(), Map.of(2, 1));
+    assertEquals(session.snapshotRuntimeStats().getRespondedByStage(), Map.of(2, 1, 1, 3));
+    assertThrows(IllegalStateException.class, () -> session.registerStages(Map.of(2, Set.of(0))));
+  }
+
+  @Test
   public void testEmptyStageNeedsNoReportsButOtherStagesStillDo()
       throws Exception {
     StreamingQuerySession session =

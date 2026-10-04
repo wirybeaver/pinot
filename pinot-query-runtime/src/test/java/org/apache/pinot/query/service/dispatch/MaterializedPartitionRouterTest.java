@@ -18,6 +18,8 @@
  */
 package org.apache.pinot.query.service.dispatch;
 
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.IntStream;
@@ -38,7 +40,6 @@ public class MaterializedPartitionRouterTest {
 
   @Test
   public void testRoutesEveryProducerPartitionToMatchingConsumer() {
-    List<WorkerMetadata> producerWorkers = workers(3);
     Map<Integer, MailboxInfos> mailboxes = Map.of(9,
         new MailboxInfos(new MailboxInfo("consumer", 1234, List.of(0))));
     List<WorkerMetadata> consumerWorkers = List.of(
@@ -50,8 +51,8 @@ public class MaterializedPartitionRouterTest {
     List<Worker.MaterializedPartitionHandle> handles = List.of(
         handle(2, 1), handle(1, 0), handle(0, 1), handle(2, 0), handle(0, 0), handle(1, 1));
 
-    List<WorkerMetadata> routed = MaterializedPartitionRouter.route(
-        REQUEST_ID, PRODUCER_STAGE_ID, producerWorkers, consumerWorkers, handles);
+    MaterializedStageOutput output = MaterializedPartitionRouter.snapshot(REQUEST_ID, PRODUCER_STAGE_ID, 3, 2, handles);
+    List<WorkerMetadata> routed = MaterializedPartitionRouter.route(output, consumerWorkers, 0);
 
     assertEquals(routed.size(), 2);
     assertEquals(routed.get(0).getWorkerId(), 0);
@@ -66,29 +67,68 @@ public class MaterializedPartitionRouterTest {
 
   @Test
   public void testRejectsMissingDuplicateAndUnexpectedCoverage() {
-    List<WorkerMetadata> producerWorkers = workers(2);
-    List<WorkerMetadata> consumerWorkers = workers(2);
     List<Worker.MaterializedPartitionHandle> complete =
         List.of(handle(0, 0), handle(0, 1), handle(1, 0), handle(1, 1));
 
-    assertThrows(IllegalStateException.class, () -> MaterializedPartitionRouter.route(
-        REQUEST_ID, PRODUCER_STAGE_ID, producerWorkers, consumerWorkers, complete.subList(0, 3)));
-    assertThrows(IllegalStateException.class, () -> MaterializedPartitionRouter.route(
-        REQUEST_ID, PRODUCER_STAGE_ID, producerWorkers, consumerWorkers,
+    assertThrows(IllegalStateException.class, () -> MaterializedPartitionRouter.snapshot(
+        REQUEST_ID, PRODUCER_STAGE_ID, 2, 2, complete.subList(0, 3)));
+    assertThrows(IllegalStateException.class, () -> MaterializedPartitionRouter.snapshot(
+        REQUEST_ID, PRODUCER_STAGE_ID, 2, 2,
         List.of(handle(0, 0), handle(0, 0), handle(1, 0), handle(1, 1))));
-    assertThrows(IllegalStateException.class, () -> MaterializedPartitionRouter.route(
-        REQUEST_ID, PRODUCER_STAGE_ID, producerWorkers, consumerWorkers,
+    assertThrows(IllegalStateException.class, () -> MaterializedPartitionRouter.snapshot(
+        REQUEST_ID, PRODUCER_STAGE_ID, 2, 2,
         List.of(handle(0, 0), handle(0, 1), handle(1, 0), handle(1, 2))));
-    assertThrows(IllegalStateException.class, () -> MaterializedPartitionRouter.route(
-        REQUEST_ID, PRODUCER_STAGE_ID, producerWorkers, consumerWorkers,
+    assertThrows(IllegalStateException.class, () -> MaterializedPartitionRouter.snapshot(
+        REQUEST_ID, PRODUCER_STAGE_ID, 2, 2,
         List.of(handle(0, 0).toBuilder().setRequestId(8L).build(), handle(0, 1), handle(1, 0), handle(1, 1))));
   }
 
   @Test
   public void testEmptyProducerHasNoInputs() {
-    List<WorkerMetadata> routed = MaterializedPartitionRouter.route(
-        REQUEST_ID, PRODUCER_STAGE_ID, List.of(), workers(1), List.of());
+    MaterializedStageOutput output =
+        MaterializedPartitionRouter.snapshot(REQUEST_ID, PRODUCER_STAGE_ID, 0, 1, List.of());
+    List<WorkerMetadata> routed = MaterializedPartitionRouter.route(output, workers(1), 0);
     assertEquals(routed.get(0).getMaterializedInputs(), List.of());
+  }
+
+  @Test
+  public void testCoalescesByBytesAcrossProducersWithoutRehashing() {
+    // Total bucket sizes: [40, 60, 0, 140, 0, 20]. Exact target fits; oversized buckets stay intact.
+    long[] bytes = {20, 30, 0, 70, 0, 10};
+    List<Worker.MaterializedPartitionHandle> handles = new ArrayList<>();
+    for (int partition = 0; partition < bytes.length; partition++) {
+      for (int producer = 0; producer < 2; producer++) {
+        handles.add(handle(producer, partition).toBuilder().setByteCount(bytes[partition]).build());
+      }
+    }
+    List<WorkerMetadata> workers = workers(bytes.length);
+    MaterializedStageOutput output =
+        MaterializedPartitionRouter.snapshot(REQUEST_ID, PRODUCER_STAGE_ID, 2, bytes.length, handles);
+    List<WorkerMetadata> routed = MaterializedPartitionRouter.route(output, workers, 100);
+
+    assertEquals(routed.size(), 3);
+    assertEquals(routed.get(0).getMaterializedInputs(), handles.subList(0, 6));
+    assertEquals(routed.get(1).getMaterializedInputs(), handles.subList(6, 10));
+    assertEquals(routed.get(2).getMaterializedInputs(), handles.subList(10, 12));
+    Collections.reverse(handles);
+    List<WorkerMetadata> reordered = MaterializedPartitionRouter.route(
+        MaterializedPartitionRouter.snapshot(REQUEST_ID, PRODUCER_STAGE_ID, 2, bytes.length, handles), workers, 100);
+    for (int i = 0; i < routed.size(); i++) {
+      assertEquals(reordered.get(i).getWorkerId(), i);
+      assertEquals(reordered.get(i).getMaterializedInputs(), routed.get(i).getMaterializedInputs());
+    }
+    assertEquals(MaterializedPartitionRouter.route(output, workers, 0).size(), bytes.length);
+  }
+
+  @Test
+  public void testEmptyBucketsCoalesceToOneWorker() {
+    List<Worker.MaterializedPartitionHandle> handles = List.of(handle(0, 0), handle(0, 1), handle(0, 2));
+    MaterializedStageOutput output = MaterializedPartitionRouter.snapshot(REQUEST_ID, PRODUCER_STAGE_ID, 1, 3, handles);
+
+    List<WorkerMetadata> routed = MaterializedPartitionRouter.route(output, workers(3), 100);
+
+    assertEquals(routed.size(), 1);
+    assertEquals(routed.get(0).getMaterializedInputs(), handles);
   }
 
   private static List<WorkerMetadata> workers(int count) {
