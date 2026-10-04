@@ -59,8 +59,8 @@ public class StreamingQuerySession {
   private static final Logger LOGGER = LoggerFactory.getLogger(StreamingQuerySession.class);
 
   private final long _requestId;
-  private final int _expectedOpChains;
-  private final CountDownLatch _completionLatch;
+  private int _expectedOpChains; // Guarded by _lock; staged execution admits one group at a time.
+  private volatile CountDownLatch _completionLatch;
   private final boolean _trackExpectedWorkers;
   private final Map<Integer, Set<Integer>> _expectedWorkerIdsByStage;
   /// Guards [#_stageAccumulator], [#_respondedByStage], [#_mergeFailedByStage],
@@ -128,7 +128,7 @@ public class StreamingQuerySession {
     for (Map.Entry<Integer, Set<Integer>> entry : expectedWorkerIdsByStage.entrySet()) {
       copy.put(Objects.requireNonNull(entry.getKey()), Set.copyOf(Objects.requireNonNull(entry.getValue())));
     }
-    return Collections.unmodifiableMap(copy);
+    return copy;
   }
 
   public long getRequestId() {
@@ -136,7 +136,35 @@ public class StreamingQuerySession {
   }
 
   public int getExpectedOpChains() {
-    return _expectedOpChains;
+    _lock.lock();
+    try {
+      return _expectedOpChains;
+    } finally {
+      _lock.unlock();
+    }
+  }
+
+  /// Admits a fully prepared group before its first submission. The prior group's reports and streams must be done.
+  /// Future stage counts are deliberately not reserved: rules may replace the unsubmitted graph or its parallelism.
+  public void registerStages(Map<Integer, Set<Integer>> workersByStage) {
+    _lock.lock();
+    try {
+      if (!_trackExpectedWorkers || !_openStreams.isEmpty() || _completionLatch.getCount() != 0) {
+        throw new IllegalStateException("Previous dispatch group is still active for request " + _requestId);
+      }
+      for (int stageId : workersByStage.keySet()) {
+        if (_expectedWorkerIdsByStage.containsKey(stageId)) {
+          throw new IllegalStateException("Stage already submitted: " + stageId);
+        }
+      }
+      Map<Integer, Set<Integer>> snapshot = copyExpectedWorkerIds(workersByStage);
+      int expected = snapshot.values().stream().mapToInt(Set::size).sum();
+      _expectedWorkerIdsByStage.putAll(snapshot);
+      _expectedOpChains += expected;
+      _completionLatch = new CountDownLatch(expected);
+    } finally {
+      _lock.unlock();
+    }
   }
 
   /// Registers an open server stream so the session can iterate them later for fan-out cancel. Must be called by the
@@ -464,12 +492,21 @@ public class StreamingQuerySession {
   /// Returns a snapshot of the per-stage coverage. Stage ids that received any responses (successful or
   /// merge-failed) appear in the map; missing stages are computed by the caller against the expected total.
   public Coverage snapshotCoverage() {
+    return snapshotCoverage(true);
+  }
+
+  /// Takes a detached runtime snapshot for replanning without stopping later completion reports.
+  public Coverage snapshotRuntimeStats() {
+    return snapshotCoverage(false);
+  }
+
+  private Coverage snapshotCoverage(boolean finalize) {
     _lock.lock();
     try {
       // Mark finalized so any late report is ignored (see _finalized), and deep-copy the per-stage trees so the
       // returned snapshot is fully isolated from the live accumulator: the broker flattens/serializes these StatMaps
       // on its own thread, and StatMap is not safe for concurrent read while another thread merges into it.
-      _finalized = true;
+      _finalized |= finalize;
       Map<Integer, StageStatsTreeNode> accumulatorCopy = new HashMap<>(_stageAccumulator.size());
       for (Map.Entry<Integer, StageStatsTreeNode> entry : _stageAccumulator.entrySet()) {
         accumulatorCopy.put(entry.getKey(), entry.getValue().deepCopy());

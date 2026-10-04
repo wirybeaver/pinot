@@ -770,12 +770,25 @@ public class QueryOptionsUtils {
 
   /// Returns whether the query opts into the experimental file-backed HASH exchange.
   public static boolean isMaterializedExchange(Map<String, String> queryOptions) {
-    return Boolean.parseBoolean(queryOptions.get(QueryOptionKey.MATERIALIZED_EXCHANGE));
+    return isAdaptiveExecution(queryOptions)
+        || Boolean.parseBoolean(queryOptions.get(QueryOptionKey.MATERIALIZED_EXCHANGE));
   }
 
   /// Returns whether the query opts into dependency-ordered stage dispatch.
   public static boolean isStagedDispatch(Map<String, String> queryOptions) {
-    return Boolean.parseBoolean(queryOptions.get(QueryOptionKey.STAGED_DISPATCH));
+    return isAdaptiveExecution(queryOptions) || Boolean.parseBoolean(queryOptions.get(QueryOptionKey.STAGED_DISPATCH));
+  }
+
+  /// Returns whether stage-boundary adaptive replanning is enabled for this query.
+  public static boolean isAdaptiveExecution(Map<String, String> queryOptions) {
+    return Boolean.parseBoolean(queryOptions.get(QueryOptionKey.ADAPTIVE_EXECUTION));
+  }
+
+  /// Returns the advisory coalesced partition size in file bytes; zero disables only the coalescing rule.
+  public static long getAqeTargetPartitionBytes(Map<String, String> queryOptions) {
+    Long value = checkedParseLong(QueryOptionKey.AQE_TARGET_PARTITION_BYTES,
+        queryOptions.get(QueryOptionKey.AQE_TARGET_PARTITION_BYTES), 0);
+    return value != null ? value : 64L * 1024 * 1024;
   }
 
   public static boolean isMultiClusterRoutingEnabled(Map<String, String> queryOptions, boolean defaultValue) {

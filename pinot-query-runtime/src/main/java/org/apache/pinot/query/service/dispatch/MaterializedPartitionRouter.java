@@ -25,11 +25,10 @@ import org.apache.pinot.common.proto.Worker;
 import org.apache.pinot.query.routing.WorkerMetadata;
 
 
-/// Validates complete materialized output coverage and binds logical partition `p` to consumer worker `p`.
-///
-/// Routing is deterministic and does not change worker count, worker ids, mailbox metadata, custom properties, or
-/// placement. The planner supplies workers in dense ID order; staged dispatch binds each consumer once.
-/// This class is stateless and thread-safe.
+/// Validates materialized output coverage and deterministically assigns contiguous logical partitions to workers.
+/// A positive target groups adjacent partitions by total file bytes across producers; zero keeps one partition per
+/// worker. Original partition identities are preserved, not rehashed modulo the new worker count. The planner supplies
+/// workers in dense ID order; the first K workers retain their placement and IDs. Stateless and thread-safe.
 final class MaterializedPartitionRouter {
   private static final Comparator<Worker.MaterializedPartitionHandle> HANDLE_ORDER =
       Comparator.comparingInt(Worker.MaterializedPartitionHandle::getProducerWorkerId);
@@ -37,10 +36,8 @@ final class MaterializedPartitionRouter {
   private MaterializedPartitionRouter() {
   }
 
-  static List<WorkerMetadata> route(long requestId, int producerStageId, List<WorkerMetadata> producerWorkers,
-      List<WorkerMetadata> consumerWorkers, List<Worker.MaterializedPartitionHandle> availableHandles) {
-    int producerCount = producerWorkers.size();
-    int partitionCount = consumerWorkers.size();
+  static MaterializedStageOutput snapshot(long requestId, int producerStageId, int producerCount, int partitionCount,
+      List<Worker.MaterializedPartitionHandle> availableHandles) {
     boolean[][] covered = new boolean[producerCount][partitionCount];
     List<List<Worker.MaterializedPartitionHandle>> assigned = new ArrayList<>(partitionCount);
     for (int i = 0; i < partitionCount; i++) {
@@ -55,6 +52,9 @@ final class MaterializedPartitionRouter {
       actualCount++;
       if (handle.getRequestId() != requestId) {
         throw new IllegalStateException("Unexpected materialized input request id: " + handle.getRequestId());
+      }
+      if (handle.getByteCount() < 0 || handle.getRowCount() < 0) {
+        throw new IllegalStateException("Negative materialized partition statistics: " + identity(handle));
       }
       int producerWorkerId = handle.getProducerWorkerId();
       int partitionId = handle.getLogicalPartitionId();
@@ -75,14 +75,50 @@ final class MaterializedPartitionRouter {
           + ": expected=" + expectedCount + ", actual=" + actualCount);
     }
 
-    List<WorkerMetadata> routed = new ArrayList<>(partitionCount);
-    for (int workerId = 0; workerId < partitionCount; workerId++) {
-      WorkerMetadata original = consumerWorkers.get(workerId);
-      List<Worker.MaterializedPartitionHandle> inputs = assigned.get(workerId);
-      inputs.sort(HANDLE_ORDER);
-      routed.add(original.withMaterializedInputs(inputs));
+    assigned.forEach(inputs -> inputs.sort(HANDLE_ORDER));
+    return new MaterializedStageOutput(producerStageId, producerCount, assigned);
+  }
+
+  static List<WorkerMetadata> route(MaterializedStageOutput output, List<WorkerMetadata> consumerWorkers,
+      long targetBytes) {
+    if (output.workerCount() == 0 && targetBytes > 0) {
+      return List.of(consumerWorkers.get(0).withMaterializedInputs(List.of()));
+    }
+    List<List<Worker.MaterializedPartitionHandle>> partitions = output.partitions();
+    List<List<Worker.MaterializedPartitionHandle>> groups =
+        targetBytes > 0 && partitions.size() > 1 ? coalesce(partitions, targetBytes) : partitions;
+    if (groups.size() > consumerWorkers.size()) {
+      // Another rule may already have chosen fewer consumers. Do not undo that decision or truncate physical buckets.
+      return consumerWorkers;
+    }
+    List<WorkerMetadata> routed = new ArrayList<>(groups.size());
+    for (int workerId = 0; workerId < groups.size(); workerId++) {
+      routed.add(consumerWorkers.get(workerId).withMaterializedInputs(groups.get(workerId)));
     }
     return List.copyOf(routed);
+  }
+
+  private static List<List<Worker.MaterializedPartitionHandle>> coalesce(
+      List<List<Worker.MaterializedPartitionHandle>> partitions, long targetBytes) {
+    List<List<Worker.MaterializedPartitionHandle>> groups = new ArrayList<>();
+    List<Worker.MaterializedPartitionHandle> current = new ArrayList<>();
+    long currentBytes = 0;
+    for (List<Worker.MaterializedPartitionHandle> partition : partitions) {
+      long bytes = 0;
+      for (Worker.MaterializedPartitionHandle handle : partition) {
+        bytes = Math.addExact(bytes, handle.getByteCount());
+      }
+      // Empty partitions attach to a neighbor, including an oversized partition. All-empty input still has one worker.
+      if (currentBytes > 0 && bytes > 0 && (currentBytes >= targetBytes || bytes > targetBytes - currentBytes)) {
+        groups.add(current);
+        current = new ArrayList<>();
+        currentBytes = 0;
+      }
+      current.addAll(partition);
+      currentBytes = Math.addExact(currentBytes, bytes);
+    }
+    groups.add(current);
+    return groups;
   }
 
   private static String identity(Worker.MaterializedPartitionHandle handle) {

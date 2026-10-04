@@ -981,6 +981,12 @@ public class CommonConstants {
         public static final String MATERIALIZED_EXCHANGE = "materializedExchange";
         /// Opts a query into dependency-ordered stage dispatch. The feature is disabled by default.
         public static final String STAGED_DISPATCH = "stagedDispatch";
+        /// Enables stage-boundary adaptive physical replanning, including materialized exchange and staged dispatch.
+        /// Default false. Enable only after all servers support late-bound materialized inputs.
+        public static final String ADAPTIVE_EXECUTION = "adaptiveExecution";
+        /// Advisory serialized-file bytes per coalesced consumer (default 64 MiB). Zero disables this rule without
+        /// disabling other adaptive rules. Has no effect unless adaptiveExecution is enabled.
+        public static final String AQE_TARGET_PARTITION_BYTES = "aqeTargetPartitionBytes";
         /// If set, changes the explain behavior in multi-stage engine.
         ///
         /// `true` means to ask servers for the physical plan while false means to just use logical plan.

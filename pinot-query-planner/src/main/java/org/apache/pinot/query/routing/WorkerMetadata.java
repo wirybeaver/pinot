@@ -113,7 +113,17 @@ public class WorkerMetadata {
   /// Copies this worker's routing and segment metadata, replacing only its materialized inputs.
   /// Segment maps retain their existing shared, read-only representation, including unparsed legacy JSON.
   public WorkerMetadata withMaterializedInputs(List<Worker.MaterializedPartitionHandle> materializedInputs) {
-    WorkerMetadata copy = new WorkerMetadata(_workerId, _mailboxInfosMap, _customProperties, materializedInputs);
+    return copyWithRouting(_mailboxInfosMap, materializedInputs);
+  }
+
+  /// Copies this worker with replacement mailbox routing, without mutating shared or serialized mailbox infos.
+  public WorkerMetadata withMailboxInfos(Map<Integer, MailboxInfos> mailboxInfos) {
+    return copyWithRouting(mailboxInfos, _materializedInputs);
+  }
+
+  private WorkerMetadata copyWithRouting(Map<Integer, MailboxInfos> mailboxInfos,
+      List<Worker.MaterializedPartitionHandle> materializedInputs) {
+    WorkerMetadata copy = new WorkerMetadata(_workerId, mailboxInfos, _customProperties, materializedInputs);
     copy._tableSegmentsMap = _tableSegmentsMap;
     copy._logicalTableSegmentsMap = _logicalTableSegmentsMap;
     copy._tableSegmentsMapJson = _tableSegmentsMapJson;
